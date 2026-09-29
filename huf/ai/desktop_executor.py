@@ -694,7 +694,11 @@ def _verify_device_proof(raw_key, executor_id, device_id, device_proof, proof_ts
 		ts = int(proof_ts)
 	except (TypeError, ValueError):
 		raise frappe.ValidationError("proof_ts is required with a device registration")
-	if abs(int(time.time()) - ts) > PROOF_MAX_SKEW_S:
+	# ``proof_ts`` is epoch seconds or milliseconds (a desktop should send milliseconds: an Ed25519
+	# signature is deterministic, so two proofs with the same timestamp are the same proof and the
+	# second one is refused as a replay).
+	seconds = ts / 1000.0 if ts > 10**11 else ts
+	if abs(time.time() - seconds) > PROOF_MAX_SKEW_S:
 		raise frappe.PermissionError("device proof is outside the allowed clock skew")
 	signature = _b64decode(device_proof, "device_proof")
 	try:
@@ -810,7 +814,7 @@ def register_desktop_executor(
 
 	Additive fields (an older desktop that sends none of them keeps working, without a device):
 
-	* ``device_id`` / ``public_key`` / ``device_proof`` / ``proof_ts``: a stable device identity.
+	* ``device_id`` / ``public_key`` / ``device_proof`` / ``proof_ts`` (epoch ms or s): a stable device identity.
 	  ``public_key`` is an Ed25519 key (base64, raw or SPKI DER); ``device_id`` is derived from it
 	  (:func:`derive_device_id`) and, when sent, must match. ``device_proof`` is the base64 Ed25519
 	  signature of :func:`registration_proof_message`; it proves the desktop holds the private key.

@@ -58,7 +58,7 @@ class Device:
 		if ts is None:
 			# Ed25519 is deterministic: two proofs in the same second would be identical and the
 			# server (rightly) treats a repeated proof as a replay, so a real desktop uses a fresh ts.
-			ts = max(int(time.time()), self._last_ts + 1)
+			ts = max(int(time.time() * 1000), self._last_ts + 1)
 			self._last_ts = ts
 		message = dx.registration_proof_message(executor_id, self.device_id, ts)
 		signature = (signer or self.private).sign(message)
@@ -140,6 +140,10 @@ class RemoteBase(unittest.TestCase):
 			except Exception:
 				pass
 		frappe.set_user("Administrator")
+		for row in frappe.get_all(
+			"Desktop Remote Audit", filters={"user": ["in", [self.owner, self.other]]}, pluck="name"
+		):
+			frappe.delete_doc("Desktop Remote Audit", row, ignore_permissions=True, force=True)
 		for doctype, name in reversed(self.made):
 			if doctype == "Agent Conversation":
 				for dt in ("Agent Message", "Agent Run"):
@@ -361,6 +365,41 @@ class TestDeviceIdentity(RemoteBase):
 				workspace=h.workspace(),
 				capabilities=CAPS,
 				**reg,
+			)
+
+	def test_second_and_millisecond_timestamps_are_both_accepted(self):
+		frappe.set_user(self.owner)
+		seconds = self.device.registration(self.exec_id, ts=int(time.time()))
+		self.assertTrue(
+			h.register_desktop_executor(
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**seconds,
+			)["ok"]
+		)
+		self.leases.append(self.exec_id)
+		millis = self.device.registration(self.exec_id)  # milliseconds
+		self.assertGreater(millis["proof_ts"], 10**11)
+		self.assertTrue(
+			h.register_desktop_executor(
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**millis,
+			)["ok"]
+		)
+		# a millisecond timestamp far in the past is stale too
+		stale = self.device.registration(self.exec_id, ts=int((time.time() - 3600) * 1000))
+		with self.assertRaises(frappe.PermissionError):
+			h.register_desktop_executor(
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**stale,
 			)
 
 	def test_stale_proof_is_rejected(self):
