@@ -36,7 +36,9 @@ REMOTE_DISABLED_MESSAGE = {
 # --------------------------------------------------------------------------
 
 
-def audit(action, outcome, user=None, device_id=None, origin=None, conversation=None, agent=None, detail=None):
+def audit(
+	action, outcome, user=None, device_id=None, origin=None, conversation=None, agent=None, detail=None
+):
 	"""Append one ``Desktop Remote Audit`` row. Never raises: an audit failure must not change the
 	outcome of the action it describes."""
 	try:
@@ -194,7 +196,9 @@ def resolve_hosted_run(conversation, agent_doc, desktop_lease_secret=None):
 			return (
 				None,
 				None,
-				run_error("remote_disabled", REMOTE_DISABLED_MESSAGE[off], conversation, disabled_by=off, **extra),
+				run_error(
+					"remote_disabled", REMOTE_DISABLED_MESSAGE[off], conversation, disabled_by=off, **extra
+				),
 			)
 		audit(
 			"remote_run",
@@ -259,7 +263,14 @@ def set_desktop_permission_mode(device_id=None, mode=None):
 			last_seen=dx.device_last_seen(user, device_id) if isinstance(device_id, str) else None,
 		)
 	if not lease.get("remote_control"):
-		audit("set_permission_mode", "remote_disabled", user=user, device_id=device_id, origin="remote", detail=mode)
+		audit(
+			"set_permission_mode",
+			"remote_disabled",
+			user=user,
+			device_id=device_id,
+			origin="remote",
+			detail=mode,
+		)
 		return _fail("remote_disabled", REMOTE_DISABLED_MESSAGE["desktop"])
 
 	ws = lease.get("workspace") or {}
@@ -279,7 +290,9 @@ def set_desktop_permission_mode(device_id=None, mode=None):
 			origin="remote",
 			detail=f"{previous} -> {mode}",
 		)
-		return _fail(error.get("code") or "internal", error.get("message") or "The desktop did not apply the change.")
+		return _fail(
+			error.get("code") or "internal", error.get("message") or "The desktop did not apply the change."
+		)
 	applied = (answer.get("data") or {}).get("mode")
 	if applied != mode:
 		audit(
@@ -290,7 +303,9 @@ def set_desktop_permission_mode(device_id=None, mode=None):
 			origin="remote",
 			detail=f"{previous} -> {mode}, desktop reports {applied}",
 		)
-		return _fail("mode_not_applied", "The desktop did not apply the requested mode.", applied_mode=applied)
+		return _fail(
+			"mode_not_applied", "The desktop did not apply the requested mode.", applied_mode=applied
+		)
 
 	fresh = dx._get_lease(lease["executor_id"])
 	if fresh:
@@ -331,7 +346,9 @@ def rebind_desktop_conversation(conversation=None, workspace_fingerprint=None):
 	lease = dx.find_device_lease(user, conv.host_device_id)
 	if not lease:
 		return _fail(
-			"desktop_offline", "The desktop is offline.", last_seen=dx.device_last_seen(user, conv.host_device_id)
+			"desktop_offline",
+			"The desktop is offline.",
+			last_seen=dx.device_last_seen(user, conv.host_device_id),
 		)
 	ws = lease.get("workspace") or {}
 	current = ws.get("fingerprint")
@@ -357,7 +374,12 @@ def rebind_desktop_conversation(conversation=None, workspace_fingerprint=None):
 		conversation=conversation,
 		detail=f"{conv.host_workspace_fingerprint} -> {current}",
 	)
-	return {"ok": True, "conversation": conversation, "host_workspace_fingerprint": current, "host_label": label}
+	return {
+		"ok": True,
+		"conversation": conversation,
+		"host_workspace_fingerprint": current,
+		"host_label": label,
+	}
 
 
 @frappe.whitelist()

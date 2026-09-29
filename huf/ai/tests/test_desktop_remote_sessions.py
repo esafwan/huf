@@ -175,7 +175,9 @@ class RemoteBase(unittest.TestCase):
 		self.agent = agent.name
 		return agent
 
-	def register(self, user=None, executor_id=None, device="default", remote_control=False, caps=None, ws=None, **kw):
+	def register(
+		self, user=None, executor_id=None, device="default", remote_control=False, caps=None, ws=None, **kw
+	):
 		user = user or self.owner
 		executor_id = executor_id or self.exec_id
 		frappe.set_user(user)
@@ -274,7 +276,9 @@ class RemoteBase(unittest.TestCase):
 			if device_id:
 				filters["device_id"] = device_id
 			return frappe.get_all(
-				"Desktop Remote Audit", filters=filters, fields=["name", "outcome", "user", "detail", "origin"]
+				"Desktop Remote Audit",
+				filters=filters,
+				fields=["name", "outcome", "user", "detail", "origin"],
 			)
 		finally:
 			frappe.set_user(previous)
@@ -339,7 +343,11 @@ class TestDeviceIdentity(RemoteBase):
 		reg["device_id"] = "0" * 32
 		with self.assertRaises(frappe.ValidationError):
 			h.register_desktop_executor(
-				executor_id=self.exec_id, protocol_version=1, workspace=h.workspace(), capabilities=CAPS, **reg
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**reg,
 			)
 
 	def test_a_device_id_without_a_proof_cannot_be_claimed(self):
@@ -348,7 +356,11 @@ class TestDeviceIdentity(RemoteBase):
 		reg.pop("device_proof")
 		with self.assertRaises(frappe.ValidationError):
 			h.register_desktop_executor(
-				executor_id=self.exec_id, protocol_version=1, workspace=h.workspace(), capabilities=CAPS, **reg
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**reg,
 			)
 
 	def test_stale_proof_is_rejected(self):
@@ -356,7 +368,11 @@ class TestDeviceIdentity(RemoteBase):
 		reg = self.device.registration(self.exec_id, ts=int(time.time()) - 3600)
 		with self.assertRaises(frappe.PermissionError):
 			h.register_desktop_executor(
-				executor_id=self.exec_id, protocol_version=1, workspace=h.workspace(), capabilities=CAPS, **reg
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**reg,
 			)
 
 	def test_a_proof_cannot_be_replayed(self):
@@ -369,7 +385,11 @@ class TestDeviceIdentity(RemoteBase):
 		h.unregister_desktop_executor(executor_id=self.exec_id)
 		with self.assertRaises(frappe.PermissionError):
 			dx.register_desktop_executor(
-				executor_id=self.exec_id, protocol_version=1, workspace=h.workspace(), capabilities=CAPS, **reg
+				executor_id=self.exec_id,
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**reg,
 			)
 
 	def test_a_proof_for_one_executor_id_does_not_register_another(self):
@@ -377,7 +397,11 @@ class TestDeviceIdentity(RemoteBase):
 		reg = self.device.registration(self.exec_id)
 		with self.assertRaises(frappe.PermissionError):
 			dx.register_desktop_executor(
-				executor_id=self.exec_id + "x", protocol_version=1, workspace=h.workspace(), capabilities=CAPS, **reg
+				executor_id=self.exec_id + "x",
+				protocol_version=1,
+				workspace=h.workspace(),
+				capabilities=CAPS,
+				**reg,
 			)
 
 	def test_relaunch_with_a_new_executor_id_supersedes_the_old_lease(self):
@@ -453,7 +477,9 @@ class TestLeaseSecret(RemoteBase):
 	def test_pending_calls_are_unreadable_without_the_secret(self):
 		results = []
 		thread, errors = self.dispatch_in_thread(results)
-		play, play_errors, seen = self.play(self.call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "x"}})])
+		play, play_errors, seen = self.play(
+			self.call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "x"}})]
+		)
 		time.sleep(1.0)
 		frappe.set_user(self.owner)
 		for wrong in (None, "", "not-the-secret", self.secret + "x", self.secret[:-1]):
@@ -466,7 +492,9 @@ class TestLeaseSecret(RemoteBase):
 	def test_the_pending_listing_with_the_secret_works_and_carries_no_credential(self):
 		results = []
 		thread, errors = self.dispatch_in_thread(results)
-		play, play_errors, seen = self.play(self.call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {}})])
+		play, play_errors, seen = self.play(
+			self.call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {}})]
+		)
 		self.finish(play, play_errors)
 		self.finish(thread, errors)
 		self.assertNotIn(self.secret, json.dumps(seen))
@@ -490,12 +518,19 @@ class TestLeaseSecret(RemoteBase):
 				)
 			with self.assertRaises(frappe.PermissionError):
 				dx.submit_desktop_tool_event(
-					call_id=self.call_id, executor_id=self.exec_id, kind=kind, payload=payload, lease_secret="guess"
+					call_id=self.call_id,
+					executor_id=self.exec_id,
+					kind=kind,
+					payload=payload,
+					lease_secret="guess",
 				)
 		# the real desktop answers; the model sees ITS result, not the forgery
 		h.submit_desktop_tool_event(call_id=self.call_id, executor_id=self.exec_id, kind="ack", payload={})
 		h.submit_desktop_tool_event(
-			call_id=self.call_id, executor_id=self.exec_id, kind="result", payload={"ok": True, "data": {"content": "REAL"}}
+			call_id=self.call_id,
+			executor_id=self.exec_id,
+			kind="result",
+			payload={"ok": True, "data": {"content": "REAL"}},
 		)
 		self.finish(thread, errors)
 		self.assertTrue(results[0]["ok"])
@@ -504,7 +539,9 @@ class TestLeaseSecret(RemoteBase):
 	def test_heartbeat_unregister_and_catalog_need_the_secret(self):
 		frappe.set_user(self.owner)
 		with self.assertRaises(frappe.PermissionError):
-			dx.heartbeat_desktop_executor(executor_id=self.exec_id, workspace=h.workspace(), socket_connected=True)
+			dx.heartbeat_desktop_executor(
+				executor_id=self.exec_id, workspace=h.workspace(), socket_connected=True
+			)
 		with self.assertRaises(frappe.PermissionError):
 			dx.unregister_desktop_executor(executor_id=self.exec_id)
 		with self.assertRaises(frappe.PermissionError):
@@ -512,7 +549,9 @@ class TestLeaseSecret(RemoteBase):
 		# the lease survived the web session's attempts and works for the desktop
 		self.assertIsNotNone(dx._get_lease(self.exec_id))
 		self.assertTrue(h.heartbeat_desktop_executor(executor_id=self.exec_id, workspace=h.workspace())["ok"])
-		self.assertTrue(h.register_desktop_catalog(executor_id=self.exec_id, catalog={"v": 1, "skills": []})["ok"])
+		self.assertTrue(
+			h.register_desktop_catalog(executor_id=self.exec_id, catalog={"v": 1, "skills": []})["ok"]
+		)
 
 	def test_secret_in_the_request_header_is_accepted(self):
 		frappe.set_user(self.owner)
@@ -537,7 +576,8 @@ class TestLeaseSecret(RemoteBase):
 		with self.assertRaises(frappe.PermissionError):
 			dx.list_pending_desktop_tool_calls(executor_id=self.exec_id, lease_secret=self.secret)
 		self.assertEqual(
-			dx.list_pending_desktop_tool_calls(executor_id=self.exec_id, lease_secret=second["lease_secret"]), []
+			dx.list_pending_desktop_tool_calls(executor_id=self.exec_id, lease_secret=second["lease_secret"]),
+			[],
 		)
 
 	def test_the_secret_never_appears_in_a_web_readable_place(self):
@@ -609,12 +649,18 @@ class TestHostedConversation(RemoteBase):
 		self.assertEqual(row.execution_host, "desktop")
 		self.assertEqual(row.host_label, "Test MacBook - my-project")
 		shape = _to_public_shape(frappe.get_doc("Agent Conversation", conv))
-		self.assertEqual(shape["host"], {"type": "desktop", "device_id": self.device.device_id, "label": row.host_label})
+		self.assertEqual(
+			shape["host"], {"type": "desktop", "device_id": self.device.device_id, "label": row.host_label}
+		)
 		# a server conversation has no host block
 		server = agent_chat.create_conversation(self.agent)
 		self.track_conversation(server["conversation_id"])
-		self.assertNotIn("host", _to_public_shape(frappe.get_doc("Agent Conversation", server["conversation_id"])))
-		self.assertEqual(frappe.db.get_value("Agent Conversation", server["conversation_id"], "execution_host"), "server")
+		self.assertNotIn(
+			"host", _to_public_shape(frappe.get_doc("Agent Conversation", server["conversation_id"]))
+		)
+		self.assertEqual(
+			frappe.db.get_value("Agent Conversation", server["conversation_id"], "execution_host"), "server"
+		)
 
 	def test_a_web_session_cannot_create_a_hosted_conversation(self):
 		frappe.set_user(self.owner)
@@ -679,7 +725,10 @@ class TestHostedConversation(RemoteBase):
 			with self.assertRaises(frappe.PermissionError, msg=field):
 				frappe.client.set_value("Agent Conversation", conv, field, value)
 		row = frappe.db.get_value(
-			"Agent Conversation", conv, ["execution_host", "host_device_id", "host_workspace_fingerprint"], as_dict=True
+			"Agent Conversation",
+			conv,
+			["execution_host", "host_device_id", "host_workspace_fingerprint"],
+			as_dict=True,
 		)
 		self.assertEqual(row.execution_host, "desktop")
 		self.assertEqual(row.host_device_id, self.device.device_id)
@@ -762,7 +811,11 @@ class TestHostedConversation(RemoteBase):
 		conv = self.hosted_conversation()
 		self.expire_lease()
 		frappe.set_user(self.owner)
-		for kwargs in ({}, {"desktop_executor_id": "exec-not-mine-01"}, {"desktop_executor_id": self.exec_id}):
+		for kwargs in (
+			{},
+			{"desktop_executor_id": "exec-not-mine-01"},
+			{"desktop_executor_id": self.exec_id},
+		):
 			result = ai.run_agent_sync(
 				agent_name=self.agent, prompt="hi", conversation_id=conv, channel_id="Chat", **kwargs
 			)
@@ -987,7 +1040,10 @@ class TestHostedConversation(RemoteBase):
 		self.assertTrue(out["ok"])
 		self.assertEqual(out["host_workspace_fingerprint"], "bbbbbbbbbbbbbbbb")
 		row = frappe.db.get_value(
-			"Agent Conversation", conv, ["host_device_id", "host_workspace_fingerprint", "execution_host"], as_dict=True
+			"Agent Conversation",
+			conv,
+			["host_device_id", "host_workspace_fingerprint", "execution_host"],
+			as_dict=True,
 		)
 		self.assertEqual(row.host_device_id, self.device.device_id)  # the device never changes
 		self.assertEqual(row.host_workspace_fingerprint, "bbbbbbbbbbbbbbbb")
@@ -1002,7 +1058,9 @@ class TestHostedConversation(RemoteBase):
 		out = ds.rebind_desktop_conversation(conversation=conv, workspace_fingerprint="dddddddddddddddd")
 		self.assertEqual(out["error"]["code"], "workspace_changed")
 		# not while a run is in flight
-		run = frappe.get_doc({"doctype": "Agent Run", "agent": self.agent, "conversation": conv, "status": "Queued"})
+		run = frappe.get_doc(
+			{"doctype": "Agent Run", "agent": self.agent, "conversation": conv, "status": "Queued"}
+		)
 		run.insert(ignore_permissions=True)
 		out = ds.rebind_desktop_conversation(conversation=conv)
 		self.assertEqual(out["error"]["code"], "run_in_progress")
@@ -1064,7 +1122,9 @@ class TestPermissionModeControl(RemoteBase):
 			request = self.pending_control()
 			seen.append(request)
 			if ack_first:
-				h.submit_desktop_tool_event(call_id=request["call_id"], executor_id=self.exec_id, kind="ack", payload={})
+				h.submit_desktop_tool_event(
+					call_id=request["call_id"], executor_id=self.exec_id, kind="ack", payload={}
+				)
 			time.sleep(0.2)
 			h.submit_desktop_tool_event(
 				call_id=request["call_id"],
@@ -1087,11 +1147,15 @@ class TestPermissionModeControl(RemoteBase):
 		self.assertEqual(request["op"], dx.CONTROL_SET_PERMISSION_MODE)
 		self.assertEqual(request["params"], {"mode": "auto", "fingerprint": h.FP})
 		self.assertEqual(request["origin"], "remote")
-		self.assertEqual(dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "auto")
+		self.assertEqual(
+			dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "auto"
+		)
 		self.assertEqual(frappe.parse_json(json.dumps(ds.list_desktop_hosts()))[0]["mode"], "auto")
 		rows = self.audit_rows("set_permission_mode", self.device.device_id)
 		self.assertEqual(len(rows), 1)
-		self.assertEqual((rows[0].outcome, rows[0].user, rows[0].detail), ("applied", self.owner, "ask -> auto"))
+		self.assertEqual(
+			(rows[0].outcome, rows[0].user, rows[0].detail), ("applied", self.owner, "ask -> auto")
+		)
 		# the control request left nothing behind
 		frappe.set_user(self.owner)
 		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
@@ -1110,8 +1174,12 @@ class TestPermissionModeControl(RemoteBase):
 		self.assertFalse(out["ok"])
 		self.assertEqual(out["error"]["code"], "remote_disabled")
 		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
-		self.assertEqual(dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "ask")
-		self.assertEqual(self.audit_rows("set_permission_mode", self.device.device_id)[0].outcome, "remote_disabled")
+		self.assertEqual(
+			dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "ask"
+		)
+		self.assertEqual(
+			self.audit_rows("set_permission_mode", self.device.device_id)[0].outcome, "remote_disabled"
+		)
 
 	def test_another_users_device_looks_offline_and_is_untouched(self):
 		frappe.set_user(self.other)
@@ -1143,7 +1211,9 @@ class TestPermissionModeControl(RemoteBase):
 		self.finish(thread, errors)
 		self.assertEqual(out["error"]["code"], "mode_not_applied")
 		self.assertEqual(out["error"]["applied_mode"], "sandbox")
-		self.assertEqual(dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "ask")
+		self.assertEqual(
+			dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "ask"
+		)
 
 	def test_a_desktop_error_is_surfaced(self):
 		thread, errors, _seen = self.play_control(
@@ -1163,12 +1233,16 @@ class TestPermissionModeControl(RemoteBase):
 		self.assertEqual(out["error"]["code"], "desktop_unreachable")
 		self.assertLess(time.monotonic() - started, 12)
 		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
-		self.assertEqual(dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "ask")
+		self.assertEqual(
+			dx.find_device_lease(self.owner, self.device.device_id)["workspace"]["permission_mode"], "ask"
+		)
 
 	def test_a_web_session_cannot_answer_the_control_request_itself(self):
 		results = []
 		thread, errors = h.run_in_thread(
-			lambda: results.append(ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full"))
+			lambda: results.append(
+				ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full")
+			)
 		)
 		request = self.pending_control()
 		frappe.set_user(self.owner)
@@ -1182,7 +1256,10 @@ class TestPermissionModeControl(RemoteBase):
 		with self.assertRaises(frappe.PermissionError):
 			dx.list_pending_desktop_tool_calls(executor_id=self.exec_id)
 		h.submit_desktop_tool_event(
-			call_id=request["call_id"], executor_id=self.exec_id, kind="result", payload={"ok": True, "data": {"mode": "ask"}}
+			call_id=request["call_id"],
+			executor_id=self.exec_id,
+			kind="result",
+			payload={"ok": True, "data": {"mode": "ask"}},
 		)
 		self.finish(thread, errors)
 		self.assertEqual(results[0]["error"]["code"], "mode_not_applied")
@@ -1248,7 +1325,9 @@ class TestAgentDesktopPolicy(RemoteBase):
 		self.assertEqual(self.names(agent, {"agent_policy": pinned}), set(TOOLS) - {"desktop_run_command"})
 
 	def test_the_run_pin_carries_the_effective_policy_and_it_is_signed(self):
-		agent = self.make_agent(desktop_access_processes="ask", desktop_access_browser="off", allow_remote_desktop=1)
+		agent = self.make_agent(
+			desktop_access_processes="ask", desktop_access_browser="off", allow_remote_desktop=1
+		)
 		conv = self.hosted_conversation(agent=agent.name)
 		result = self.send(conv, secret=self.secret)
 		pin = self.pin_of(result["agent_run_id"])
@@ -1295,7 +1374,9 @@ class TestAgentDesktopPolicy(RemoteBase):
 		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 		# files stay allowed: the same policy passes a read to the desktop
 		call_id = f"call-rs-{frappe.generate_hash(length=10)}"
-		thread, errors, seen = self.play(call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {}})])
+		thread, errors, seen = self.play(
+			call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {}})]
+		)
 		frappe.set_user(self.owner)
 		ok = dx.dispatch("fs.read", {"path": "a"}, ctx, call_id=call_id)
 		self.finish(thread, errors)
