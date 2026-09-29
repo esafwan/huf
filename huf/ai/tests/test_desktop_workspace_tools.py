@@ -214,14 +214,14 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 		cls.owner = h.make_user("dxown")
 		cls.other = h.make_user("dxoth")
 		cls.exec_id = "exec-ctxval-0001"
-		cls.run = h.make_run(cls.owner, h.desktop_pin(cls.exec_id, cls.owner, label="proj"))
+		cls.run_name = h.make_run(cls.owner, h.desktop_pin(cls.exec_id, cls.owner, label="proj"))
 		cls.run_no_desktop = h.make_run(cls.owner, {"foo": "bar"})
 		cls.run_empty = h.make_run(cls.owner, {})
 
 	@classmethod
 	def tearDownClass(cls):
 		h.delete_docs(
-			[("Agent Run", n) for n in (cls.run, cls.run_no_desktop, cls.run_empty)]
+			[("Agent Run", n) for n in (cls.run_name, cls.run_no_desktop, cls.run_empty)]
 			+ [("User", cls.owner), ("User", cls.other)]
 		)
 		super().tearDownClass()
@@ -234,13 +234,13 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 			_dx_executor_id=self.exec_id,
 			_dx_fingerprint=h.FP,
 			_dx_user=self.owner,
-			agent_run_id=self.run,
+			agent_run_id=self.run_name,
 		)
 		args.update(over)
 		return desktop_workspace._validate_executor_context(**args)
 
 	def test_runtime_context_is_a_json_string_on_the_row(self):
-		raw = frappe.db.get_value("Agent Run", self.run, "runtime_context")
+		raw = frappe.db.get_value("Agent Run", self.run_name, "runtime_context")
 		self.assertIsInstance(raw, str)
 
 	def test_valid_context_returns_canonical_dispatch_ctx(self):

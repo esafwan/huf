@@ -42,8 +42,8 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.exec_id = f"exec-rt-{frappe.generate_hash(length=10)}"
 		self.call_id = f"call-rt-{frappe.generate_hash(length=10)}"
 		self.register()
-		self.run = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user))
-		self._docs.append(("Agent Run", self.run))
+		self.run_name = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user))
+		self._docs.append(("Agent Run", self.run_name))
 		frappe.set_user(self.user)
 
 	def tearDown(self):
@@ -72,7 +72,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			_dx_executor_id=self.exec_id,
 			_dx_fingerprint=h.FP,
 			_dx_user=self.user,
-			agent_run_id=self.run,
+			agent_run_id=self.run_name,
 			call_id=self.call_id,
 		)
 		kwargs.update(over)
@@ -129,7 +129,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		req = results[0][1]
 		self.assertEqual(req["executor_id"], self.exec_id)
 		self.assertEqual(req["fingerprint"], h.FP)
-		self.assertEqual(req["agent_run_id"], self.run)
+		self.assertEqual(req["agent_run_id"], self.run_name)
 		self.assertEqual(req["op"], "fs.read")
 		self.assertEqual([r[1]["status"] for r in results[1:]], ["recorded", "recorded"])
 
@@ -210,7 +210,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 
 	def test_run_phase_timeout_when_desktop_acks_then_goes_silent(self):
 		thread, errors, _ = self.play_desktop([(0.1, "ack", {})])
-		ctx = dw._validate_executor_context(self.exec_id, h.FP, self.user, self.run)
+		ctx = dw._validate_executor_context(self.exec_id, h.FP, self.user, self.run_name)
 		started = time.monotonic()
 		res = dx.dispatch("fs.read", {"path": "a.txt"}, ctx, call_id=self.call_id, timeout_ms=1500)
 		elapsed = time.monotonic() - started
