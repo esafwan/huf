@@ -129,7 +129,73 @@ def _get_lazy_discovered_tool_names(kwargs: dict) -> set:
     return set()
 
 
-def create_agent_tools(agent, model_name: str = None, **kwargs) -> list[FunctionTool]:
+def _is_desktop_workspace_tool_doc(function_doc) -> bool:
+    """True for an Agent Tool Function row that is one of the Desktop Workspace tools."""
+    from huf.ai.tools._registry import DESKTOP_WORKSPACE_TOOL_NAMES
+
+    return (function_doc.tool_name or "") in DESKTOP_WORKSPACE_TOOL_NAMES or (
+        function_doc.function_path or ""
+    ).startswith("huf.ai.tools.desktop_workspace.")
+
+
+def _build_desktop_workspace_tools(function_docs, desktop_ctx) -> list:
+    """Build the attached Desktop Workspace tools for a run pinned to a live executor.
+
+    Returns [] unless desktop_ctx carries an executor_id whose lease is live and
+    owned by the ctx user (huf.ai.desktop_executor.resolve_desktop_ctx). The
+    pinned _dx_* values come from the server-side lease, and overwrite anything
+    the LLM passes (extra_args are applied after the LLM's args).
+    """
+    if not desktop_ctx or not isinstance(desktop_ctx, dict):
+        return []
+    executor_id = desktop_ctx.get("executor_id")
+    if not executor_id:
+        return []
+
+    try:
+        from huf.ai.desktop_executor import is_lease_live, resolve_desktop_ctx
+
+        if not is_lease_live(executor_id):
+            return []
+        live = resolve_desktop_ctx(executor_id, user=desktop_ctx.get("user") or None)
+    except Exception as e:
+        frappe.logger("huf").debug(f"Desktop lease check failed: {e!s}")
+        return []
+    if not live or not live.get("executor_id") or not live.get("user"):
+        return []
+
+    extra_args = {
+        "_dx_executor_id": live["executor_id"],
+        "_dx_fingerprint": live.get("fingerprint") or "",
+        "_dx_user": live["user"],
+    }
+
+    built = []
+    seen = set()
+    for function_doc in function_docs:
+        if function_doc.tool_name in seen:
+            continue
+        try:
+            params = json.loads(function_doc.params) if function_doc.params else {}
+            params.pop("additionalProperties", None)
+            tool = create_function_tool(
+                function_doc.tool_name,
+                function_doc.description,
+                function_doc.function_path,
+                params,
+                extra_args=dict(extra_args),
+                tool_type=function_doc.types,
+                blocking=True,
+            )
+            if tool:
+                built.append(tool)
+                seen.add(function_doc.tool_name)
+        except Exception as e:
+            frappe.logger("huf").debug(f"Error wiring desktop tool {function_doc.tool_name}: {e!s}")
+    return built
+
+
+def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None = None, **kwargs) -> list[FunctionTool]:
     """
     Create function tools for Huf Agent
 
@@ -147,6 +213,12 @@ def create_agent_tools(agent, model_name: str = None, **kwargs) -> list[Function
     instead of being built, to save tokens on the tool schema payload sent to
     the model. This is gated on kwargs["conversation_id"]; callers that don't
     pass one get the fail-safe (nothing discovered yet) rather than an error.
+
+    desktop_ctx is the run's pinned Huf Desktop executor
+    ({executor_id, fingerprint, user, label}) or None. Desktop Workspace tools
+    (huf.ai.tools._registry.DESKTOP_WORKSPACE_TOOLS) are exposed only when the
+    agent has them attached (ordinary Agent Tool rows) AND desktop_ctx names an
+    executor whose lease is live; otherwise they are absent from the schema.
     """
     tools = []
     lazy_enabled = bool(getattr(agent, "enable_lazy_tools", False))
@@ -168,8 +240,15 @@ def create_agent_tools(agent, model_name: str = None, **kwargs) -> list[Function
         agent, frappe.session.user, model_name=model_name
     )
 
+    desktop_attached_docs = []
     for function_doc in allowed_tool_docs:
         try:
+            if _is_desktop_workspace_tool_doc(function_doc):
+                # Never built by the generic path: exposure is decided once,
+                # below, against the run's live desktop_ctx.
+                desktop_attached_docs.append(function_doc)
+                continue
+
             if lazy_enabled:
                 tool_name = function_doc.tool_name or ""
                 is_always_eager = (
@@ -259,6 +338,9 @@ def create_agent_tools(agent, model_name: str = None, **kwargs) -> list[Function
                 f"Error processing function {function_doc.name}: {e!s}"
             )
 
+    if desktop_attached_docs:
+        tools.extend(_build_desktop_workspace_tools(desktop_attached_docs, desktop_ctx))
+
     if lazy_enabled:
         # The discovery tools themselves are not something an agent author is
         # expected to attach via agent_tool - without them the model could
@@ -296,7 +378,12 @@ def create_agent_tools(agent, model_name: str = None, **kwargs) -> list[Function
         from huf.ai.skills.loader import load_all_skill_tools
         skill_tools = load_all_skill_tools(agent, frappe.session.user)
         if skill_tools:
-            tools.extend(skill_tools)
+            # Skill-attached tools must not bypass the desktop ctx gate.
+            from huf.ai.tools._registry import DESKTOP_WORKSPACE_TOOL_NAMES
+            tools.extend(
+                t for t in skill_tools
+                if getattr(t, "name", "") not in DESKTOP_WORKSPACE_TOOL_NAMES
+            )
     except Exception as e:
         frappe.log_error(
             title="Skill Tool Loading Error",
