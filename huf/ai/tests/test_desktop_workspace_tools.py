@@ -196,7 +196,6 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 			"agent": "test-agent",
 			"status": "Completed",
 			"owner": "Administrator",
-			"conversation": "test-conv",
 			"runtime_context": {
 				"desktop": {
 					"executor_id": "test-executor-id",
