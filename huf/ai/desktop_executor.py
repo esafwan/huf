@@ -1227,7 +1227,10 @@ def unregister_desktop_executor(executor_id=None, lease_secret=None):
 		if lease.get("device_id"):
 			try:
 				_setex(_devseen_key(user, lease["device_id"]), _now_ms(), DEVICE_SEEN_TTL_S)
-				_delete(_device_key(user, lease["device_id"]))
+				# Only when the index still points at THIS lease: a relaunched desktop may already
+				# have registered a newer one for the same device.
+				if _get(_device_key(user, lease["device_id"])) == executor_id:
+					_delete(_device_key(user, lease["device_id"]))
 			except Exception:
 				pass
 	try:
