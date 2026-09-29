@@ -18,29 +18,39 @@ Wire-compatible with ``desktop-poc/src/main/agent-tools/huf-client.ts``:
 * ``list_pending_desktop_tool_calls``-> ``[request payload, ...]``
 * ``submit_desktop_tool_event``      -> ``{status: recorded|already_recorded|expired, ...}``
 
-Redis key layout. Structured values (lease, request stash, final-result cache)
-go through ``set_value``/``get_value`` (site-prefixed). Lists, sorted sets and
-plain sets are written with RAW redis calls on unprefixed keys: the raw-key vs
-``make_key`` gotcha is documented in ``client_side_tool.py`` (``rpush`` and
-``blpop`` address the unprefixed key, so the TTL and the delete must too).
-Ids are UUIDs, so unprefixed keys do not collide across sites.
+Redis access. EVERY key (structured value, list, zset, set) goes through the
+same mechanism: a plain ``redis.Redis`` client that shares frappe's cache
+connection pool (``_raw_client``) and an explicit ``frappe.cache().make_key``
+prefix (``_k``). In Frappe 15 ``rpush``/``sadd``/``srem`` on ``frappe.cache()``
+prefix the key with the site while ``blpop``/``expire``/``delete`` do not, so the
+wrapper's list helpers are never used. Structured values are pickled the same way
+``set_value`` does, but written and read straight from Redis, so a lease read is
+never served from the per-request ``frappe.local.cache``.
+
+Waiting: the redis-cache connection has a 5 s socket timeout, so the waiter polls
+with BLPOP slices of at most ``POLL_SLICE_S`` seconds instead of one long block.
+
+Canonical ``ctx`` shape for :func:`dispatch`: ``{executor_id, fingerprint, user,
+label}`` (the run's pinned desktop context). ``_dx_*`` keys are NOT accepted.
 
     huf:dx:lease:<executor_id>   value  lease (TTL 60s)
-    huf:dx:user:<user>           set    executor ids of a user (raw)
+    huf:dx:user:<user>           set    executor ids of a user
     huf:dx:req:<call_id>         value  request stash (TTL hard cap + 30s)
-    huf:dx:pending:<executor_id> zset   call_id scored by deadline_at (raw)
-    huf:dx:res:<call_id>         list   ack / approval_pending / result / error events (raw)
+    huf:dx:pending:<executor_id> zset   call_id scored by deadline_at
+    huf:dx:res:<call_id>         list   ack / approval_pending / result / error events
     huf:dx:done:<call_id>        value  first-terminal-wins flag
     huf:dx:final:<call_id>       value  cached final result, for idempotent redispatch
 """
 
 import json
 import math
+import pickle
 import re
 import time
 import uuid
 
 import frappe
+import redis
 
 PROTOCOL_VERSION = 1
 
@@ -59,6 +69,8 @@ RESULT_JSON_MAX_BYTES = 96 * 1024
 STASH_TTL_GRACE_S = 30
 FINAL_CACHE_TTL_S = 300
 MAX_MESSAGE_CHARS = 500
+# Max seconds per BLPOP slice; must stay below the redis-cache socket_timeout (5 s).
+POLL_SLICE_S = 2
 
 TOOL_CALL_EVENT = "huf_desktop_tool_call"
 TOOL_CANCEL_EVENT = "huf_desktop_tool_cancel"
@@ -146,6 +158,40 @@ def _now_ms():
 	return int(time.time() * 1000)
 
 
+def _monotonic():
+	return time.monotonic()
+
+
+# --------------------------------------------------------------------------
+# Redis access: one mechanism for every key (see module docstring)
+# --------------------------------------------------------------------------
+
+
+def _raw_client():
+	"""Plain ``redis.Redis`` on frappe's cache pool: no frappe key-prefixing overrides."""
+	return redis.Redis(connection_pool=frappe.cache().connection_pool)
+
+
+def _k(key):
+	"""The site-prefixed physical key for a logical ``huf:dx:*`` key."""
+	return frappe.cache().make_key(key)
+
+
+def _get(key):
+	"""Read a pickled value straight from Redis (bypasses ``frappe.local.cache``)."""
+	raw = _raw_client().get(_k(key))
+	return pickle.loads(raw) if raw is not None else None
+
+
+def _setex(key, val, ttl):
+	_raw_client().setex(_k(key), ttl, pickle.dumps(val))
+
+
+def _delete(*keys):
+	if keys:
+		_raw_client().delete(*[_k(k) for k in keys])
+
+
 # --------------------------------------------------------------------------
 # Small validators
 # --------------------------------------------------------------------------
@@ -202,7 +248,7 @@ def _to_bool(value):
 def _get_lease(executor_id):
 	"""Return the live lease dict, or None (missing / expired / cache down)."""
 	try:
-		lease = frappe.cache().get_value(_lease_key(executor_id))
+		lease = _get(_lease_key(executor_id))
 	except Exception:
 		frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: lease read failed")
 		return None
@@ -210,20 +256,21 @@ def _get_lease(executor_id):
 
 
 def _put_lease(executor_id, lease):
-	frappe.cache().set_value(_lease_key(executor_id), lease, expires_in_sec=LEASE_TTL_S)
+	_setex(_lease_key(executor_id), lease, LEASE_TTL_S)
 
 
 def _index_add(user, executor_id):
 	try:
-		frappe.cache().sadd(_user_key(user), executor_id)
-		frappe.cache().expire(_user_key(user), LEASE_TTL_S * 5)
+		r = _raw_client()
+		r.sadd(_k(_user_key(user)), executor_id)
+		r.expire(_k(_user_key(user)), LEASE_TTL_S * 5)
 	except Exception:
 		pass  # advisory index only
 
 
 def _index_remove(user, executor_id):
 	try:
-		frappe.cache().srem(_user_key(user), executor_id)
+		_raw_client().srem(_k(_user_key(user)), executor_id)
 	except Exception:
 		pass
 
@@ -320,7 +367,7 @@ def unregister_desktop_executor(executor_id=None):
 	if lease and lease.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
 	try:
-		frappe.cache().delete_value(_lease_key(executor_id))
+		_delete(_lease_key(executor_id))
 	except Exception:
 		frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: unregister failed")
 	_index_remove(user, executor_id)
@@ -341,15 +388,16 @@ def list_pending_desktop_tool_calls(executor_id=None):
 
 
 def _pending_requests(executor_id):
-	cache = frappe.cache()
+	r = _raw_client()
+	pk = _k(_pending_key(executor_id))
 	out = []
 	try:
 		now = _now_ms()
-		cache.zremrangebyscore(_pending_key(executor_id), "-inf", now - 1)
-		call_ids = cache.zrangebyscore(_pending_key(executor_id), now, "+inf")
+		r.zremrangebyscore(pk, "-inf", now - 1)
+		call_ids = r.zrangebyscore(pk, now, "+inf")
 		for cid in call_ids or []:
 			cid = cid.decode() if isinstance(cid, bytes) else cid
-			stash = cache.get_value(_request_key(cid))
+			stash = _get(_request_key(cid))
 			if isinstance(stash, dict) and stash.get("request"):
 				out.append(stash["request"])
 	except Exception:
@@ -410,7 +458,7 @@ def submit_desktop_tool_event(call_id=None, executor_id=None, kind=None, payload
 	payload = _as_dict(payload, "payload")
 
 	try:
-		stash = frappe.cache().get_value(_request_key(call_id))
+		stash = _get(_request_key(call_id))
 	except Exception:
 		frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: stash read failed")
 		return {"status": "error", "message": "Could not reach the result channel (cache unavailable)."}
@@ -425,24 +473,22 @@ def submit_desktop_tool_event(call_id=None, executor_id=None, kind=None, payload
 
 	ttl = HARD_CAP_S + STASH_TTL_GRACE_S
 	if kind in TERMINAL_KINDS:
-		try:
-			if frappe.cache().get_value(_done_key(call_id)):
-				return {"status": "already_recorded"}
-		except Exception:
-			pass
 		payload = _cap_terminal_payload(kind, payload)
 		try:
-			frappe.cache().set_value(_done_key(call_id), 1, expires_in_sec=ttl)
+			# Atomic first-terminal-wins.
+			if not _raw_client().set(_k(_done_key(call_id)), 1, nx=True, ex=ttl):
+				return {"status": "already_recorded"}
 		except Exception:
 			pass
 
 	event = {"kind": kind, "payload": payload, "at": _now_ms()}
 	try:
-		frappe.cache().rpush(_result_key(call_id), json.dumps(event, default=str))
-		# Raw expire (not expire_key): see module docstring.
-		frappe.cache().expire(_result_key(call_id), ttl)
+		r = _raw_client()
+		rk = _k(_result_key(call_id))
+		r.rpush(rk, json.dumps(event, default=str))
+		r.expire(rk, ttl)
 		if kind in TERMINAL_KINDS:
-			frappe.cache().zrem(_pending_key(executor_id), call_id)
+			r.zrem(_k(_pending_key(executor_id)), call_id)
 	except Exception:
 		frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: rpush failed")
 		return {"status": "error", "message": "Could not deliver the event (cache unavailable)."}
@@ -567,14 +613,12 @@ def dispatch(
 	if not isinstance(params, dict):
 		return _error(op, label, "invalid_params", "params must be an object")
 
-	cache = frappe.cache()
-
 	# Idempotency: a finished call_id returns its cached final result.
 	try:
-		cached = cache.get_value(_final_key(call_id))
+		cached = _get(_final_key(call_id))
 		if isinstance(cached, dict):
 			return cached
-		if cache.get_value(_request_key(call_id)):
+		if _get(_request_key(call_id)):
 			return _error(op, label, "duplicate_in_flight", "This tool call is already in progress.")
 	except Exception:
 		pass
@@ -637,16 +681,13 @@ def dispatch(
 		"approval_timeout_ms": APPROVAL_TIMEOUT_MS,
 	}
 	stash_ttl = HARD_CAP_S + STASH_TTL_GRACE_S
-	started = time.monotonic()
+	started = _monotonic()
 
 	try:
-		cache.set_value(
-			_request_key(call_id),
-			{"user": user, "executor_id": executor_id, "request": request},
-			expires_in_sec=stash_ttl,
-		)
-		cache.zadd(_pending_key(executor_id), {call_id: request["deadline_at"]})
-		cache.expire(_pending_key(executor_id), stash_ttl)
+		_setex(_request_key(call_id), {"user": user, "executor_id": executor_id, "request": request}, stash_ttl)
+		r = _raw_client()
+		r.zadd(_k(_pending_key(executor_id)), {call_id: request["deadline_at"]})
+		r.expire(_k(_pending_key(executor_id)), stash_ttl)
 	except Exception:
 		frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: stash failed")
 		return _error(
@@ -664,16 +705,14 @@ def dispatch(
 			final = _wait(op, label, call_id, executor_id, lease["user"], timeout_ms, started)
 	finally:
 		try:
-			cache.delete_value(_request_key(call_id))
-			# Raw delete for the raw-written result list (see module docstring).
-			cache.delete(_result_key(call_id))
-			cache.zrem(_pending_key(executor_id), call_id)
+			_delete(_request_key(call_id), _result_key(call_id))
+			_raw_client().zrem(_k(_pending_key(executor_id)), call_id)
 		except Exception:
 			pass
 
 	if final.get("ok") or final["error"]["code"] not in ("cache_unavailable",):
 		try:
-			cache.set_value(_final_key(call_id), final, expires_in_sec=FINAL_CACHE_TTL_S)
+			_setex(_final_key(call_id), final, FINAL_CACHE_TTL_S)
 		except Exception:
 			pass
 	return final
@@ -681,20 +720,21 @@ def dispatch(
 
 def _wait(op, label, call_id, executor_id, user, timeout_ms, started):
 	"""Block on the result list: ack phase, run phase, one approval extension, hard cap."""
-	cache = frappe.cache()
-	res_key = _result_key(call_id)
+	r = _raw_client()
+	res_key = _k(_result_key(call_id))
 	hard_end = started + HARD_CAP_S
 	phase_end = started + ACK_TIMEOUT_S
 	acked = False
 	extended = False
 
 	while True:
-		remaining = min(phase_end, hard_end) - time.monotonic()
+		remaining = min(phase_end, hard_end) - _monotonic()
 		if remaining <= 0:
 			popped = None
 		else:
 			try:
-				popped = cache.blpop(res_key, timeout=max(1, math.ceil(remaining)))
+				# Short slices: the cache connection's socket_timeout is 5 s.
+				popped = r.blpop(res_key, timeout=max(1, min(POLL_SLICE_S, math.ceil(remaining))))
 			except Exception:
 				frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: blpop failed")
 				return _error(
@@ -703,6 +743,9 @@ def _wait(op, label, call_id, executor_id, user, timeout_ms, started):
 					"cache_unavailable",
 					"Lost connection to the result channel while waiting for the desktop.",
 				)
+
+		if popped is None and remaining > 0:
+			continue  # slice elapsed; keep waiting until the phase deadline
 
 		if popped is None:
 			if not acked:
@@ -724,7 +767,7 @@ def _wait(op, label, call_id, executor_id, user, timeout_ms, started):
 		except (TypeError, ValueError, KeyError, IndexError):
 			continue
 
-		now = time.monotonic()
+		now = _monotonic()
 		if kind == "ack":
 			if not acked:
 				acked = True

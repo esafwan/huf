@@ -8,7 +8,8 @@ must not exceed 512 KB. Results for read and exec operations are flagged as
 untrusted content.
 
 The handlers verify the pinned executor context (_dx_executor_id, _dx_fingerprint,
-_dx_user) matches the current run, then call desktop_executor.dispatch.
+_dx_user) matches the current run, then call desktop_executor.dispatch with the
+run's pinned ctx {executor_id, fingerprint, user, label}.
 
 See PLAN.md §3.7-3.8 for limits and specifications.
 """
@@ -79,6 +80,19 @@ def _validate_params_size(params: dict) -> None:
 		raise
 
 
+def _parse_runtime_context(value) -> dict:
+	"""Parse ``Agent Run.runtime_context`` (JSON string, dict, or empty) into a dict."""
+	if isinstance(value, dict):
+		return value
+	if not value or not isinstance(value, (str, bytes)):
+		return {}
+	try:
+		parsed = frappe.parse_json(value)
+	except Exception:
+		return {}
+	return parsed if isinstance(parsed, dict) else {}
+
+
 def _validate_executor_context(
 	_dx_executor_id: str,
 	_dx_fingerprint: str,
@@ -92,7 +106,8 @@ def _validate_executor_context(
 	- The run owner is _dx_user
 	- The session user is _dx_user
 
-	Returns the desktop context from the run.
+	Returns the canonical dispatch ctx ``{executor_id, fingerprint, user, label}``
+	built from the run's pinned desktop context.
 	"""
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Desktop tools are not available in guest sessions."))
@@ -115,9 +130,9 @@ def _validate_executor_context(
 			frappe.PermissionError,
 		)
 
-	# Check that runtime_context has desktop info and it matches
-	runtime_context = run.get("runtime_context")
-	if not runtime_context or not isinstance(runtime_context, dict):
+	# runtime_context is a JSON field: usually a string, sometimes already a dict.
+	runtime_context = _parse_runtime_context(run.get("runtime_context"))
+	if not runtime_context:
 		frappe.throw(_("Desktop context not found on this run."))
 
 	desktop_ctx = runtime_context.get("desktop")
@@ -128,7 +143,14 @@ def _validate_executor_context(
 	if pinned_executor_id != _dx_executor_id:
 		frappe.throw(_("Executor ID mismatch with the pinned context."))
 
-	return desktop_ctx
+	# Canonical ctx for desktop_executor.dispatch: {executor_id, fingerprint, user, label}.
+	# The fingerprint is the one pinned on the run at send time (not the live one).
+	return {
+		"executor_id": pinned_executor_id,
+		"fingerprint": desktop_ctx.get("fingerprint") or _dx_fingerprint or None,
+		"user": _dx_user,
+		"label": desktop_ctx.get("label"),
+	}
 
 
 def _import_dispatch_lazily():
@@ -157,14 +179,14 @@ def handle_workspace_info(
 	No parameters. Returns untrusted_content=False (metadata only).
 	"""
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="ws.info",
 		params={},
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -215,14 +237,14 @@ def handle_list_files(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.list",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -278,14 +300,14 @@ def handle_read_file(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.read",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -363,14 +385,14 @@ def handle_search_files(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.search",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -430,14 +452,14 @@ def handle_write_file(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.write",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -496,14 +518,14 @@ def handle_edit_file(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.edit",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -538,14 +560,14 @@ def handle_make_directory(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.mkdir",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -587,14 +609,14 @@ def handle_move_path(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.move",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -633,14 +655,14 @@ def handle_delete_path(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
 	result = dispatch(
 		op="fs.trash",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,
@@ -693,7 +715,7 @@ def handle_run_command(
 	_validate_params_size(params)
 
 	# Validate executor context
-	_validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
+	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
 
 	dispatch = _import_dispatch_lazily()
 
@@ -703,7 +725,7 @@ def handle_run_command(
 	result = dispatch(
 		op="exec.run",
 		params=params,
-		ctx={"_dx_executor_id": _dx_executor_id, "_dx_fingerprint": _dx_fingerprint, "_dx_user": _dx_user},
+		ctx=dx_ctx,
 		call_id=call_id,
 		conversation_id=conversation_id,
 		agent_run_id=agent_run_id,

@@ -6,7 +6,7 @@
 Covers PLAN.md security cases S22-S26 (deadline extension, offline fast-fail,
 ack timeout, wrong user, wrong executor / expired / duplicate) plus lease
 register / heartbeat / expiry / re-register. ``frappe.cache`` is replaced by an
-in-memory fake whose ``blpop`` never blocks, and realtime publishes are
+in-memory fake (strict about the site key prefix) whose ``blpop`` never blocks, and realtime publishes are
 captured, so no Redis or socket server is needed.
 
 Run with:
@@ -27,11 +27,21 @@ USER = "alice@example.com"
 OTHER = "mallory@example.com"
 
 
-class FakeCache:
-	"""Just enough of frappe's RedisWrapper for desktop_executor.
+SITE_PREFIX = "site_x|"
 
-	``blpop`` pops immediately (or returns None when empty) and records the timeout
-	it was asked for. ``on_blpop`` lets a test act as the desktop between polls.
+
+class FakeCache:
+	"""Just enough of a redis client + frappe's ``make_key`` for desktop_executor.
+
+	Every operation REQUIRES the site prefix on the key (``make_key``); an unprefixed
+	key raises, so a producer/consumer prefix mismatch (the Frappe 15 rpush-vs-blpop
+	gotcha) fails these tests. State is exposed keyed by the LOGICAL key (prefix
+	stripped) so tests can read it: ``values`` (unpickled), ``raw`` (lists),
+	``zsets``, ``sets``, ``expiries``, ``flags``.
+
+	``blpop`` pops immediately or, when empty, advances a virtual clock by the asked
+	timeout (no real sleeping) and returns None. ``on_blpop`` lets a test act as the
+	desktop between polls. ``dx._monotonic`` is patched to ``now``.
 	"""
 
 	def __init__(self):
@@ -39,66 +49,101 @@ class FakeCache:
 		self.raw = {}
 		self.zsets = {}
 		self.sets = {}
+		self.flags = {}
 		self.expiries = {}
 		self.blpop_timeouts = []
 		self.on_blpop = None
 		self.deleted_raw = []
+		self.now = 1000.0
 
-	# structured values
+	# frappe surface
+	def make_key(self, key, **_):
+		return SITE_PREFIX + key
+
+	def _l(self, key):
+		if not isinstance(key, str) or not key.startswith(SITE_PREFIX):
+			raise AssertionError(f"unprefixed redis key used: {key!r}")
+		return key[len(SITE_PREFIX):]
+
+	# test-side helpers (logical keys)
 	def set_value(self, key, val, expires_in_sec=None, **_):
 		self.values[key] = val
 		if expires_in_sec:
 			self.expiries[key] = expires_in_sec
 
-	def get_value(self, key, **_):
-		return self.values.get(key)
-
-	def delete_value(self, key, **_):
-		self.values.pop(key, None)
-
 	def expire_lease(self, executor_id):
 		self.values.pop(dx._lease_key(executor_id), None)
 
-	# raw redis
+	def seed_zadd(self, key, mapping):
+		self.zsets.setdefault(key, {}).update(mapping)
+
+	# redis surface (prefixed keys)
+	def get(self, key):
+		import pickle
+
+		k = self._l(key)
+		return pickle.dumps(self.values[k]) if k in self.values else None
+
+	def setex(self, key, ttl, value):
+		import pickle
+
+		k = self._l(key)
+		self.values[k] = pickle.loads(value)
+		self.expiries[k] = ttl
+
+	def set(self, key, value, nx=False, ex=None):
+		k = self._l(key)
+		if nx and k in self.flags:
+			return None
+		self.flags[k] = value
+		if ex:
+			self.expiries[k] = ex
+		return True
+
+	def delete(self, *keys):
+		for key in keys:
+			k = self._l(key)
+			self.deleted_raw.append(k)
+			self.values.pop(k, None)
+			self.raw.pop(k, None)
+
 	def rpush(self, key, val):
-		self.raw.setdefault(key, []).append(val)
+		self.raw.setdefault(self._l(key), []).append(val)
 
 	def expire(self, key, ttl):
-		self.expiries[key] = ttl
-
-	def delete(self, key):
-		self.deleted_raw.append(key)
-		self.raw.pop(key, None)
+		self.expiries[self._l(key)] = ttl
 
 	def blpop(self, key, timeout=0):
+		k = self._l(key)
 		self.blpop_timeouts.append(timeout)
 		if self.on_blpop:
 			cb, self.on_blpop = self.on_blpop, None
 			cb()
-		lst = self.raw.get(key) or []
+		lst = self.raw.get(k) or []
 		if not lst:
+			self.now += timeout
 			return None
 		return (key, lst.pop(0))
 
 	def zadd(self, key, mapping):
-		self.zsets.setdefault(key, {}).update(mapping)
+		self.zsets.setdefault(self._l(key), {}).update(mapping)
 
 	def zrem(self, key, member):
-		self.zsets.get(key, {}).pop(member, None)
+		self.zsets.get(self._l(key), {}).pop(member, None)
 
 	def zremrangebyscore(self, key, lo, hi):
-		z = self.zsets.get(key, {})
+		z = self.zsets.get(self._l(key), {})
 		for m in [m for m, s in z.items() if s <= hi]:
 			del z[m]
 
 	def zrangebyscore(self, key, lo, hi):
-		return [m for m, s in self.zsets.get(key, {}).items() if s >= lo]
+		return [m for m, s in self.zsets.get(self._l(key), {}).items() if s >= lo]
 
 	def sadd(self, key, member):
-		self.sets.setdefault(key, set()).add(member)
+		self.sets.setdefault(self._l(key), set()).add(member)
 
 	def srem(self, key, member):
-		self.sets.get(key, set()).discard(member)
+		self.sets.get(self._l(key), set()).discard(member)
 
 
 def _ws(fp=FP, mode="ask"):
@@ -112,6 +157,8 @@ class DesktopExecutorTestCase(unittest.TestCase):
 		self.session.user = USER
 		patches = [
 			mock.patch.object(dx.frappe, "cache", return_value=self.cache),
+			mock.patch.object(dx, "_raw_client", return_value=self.cache),
+			mock.patch.object(dx, "_monotonic", side_effect=lambda: self.cache.now),
 			mock.patch.object(dx.frappe, "session", self.session),
 			mock.patch.object(dx.frappe, "log_error"),
 		]
@@ -278,7 +325,9 @@ class TestDispatch(DesktopExecutorTestCase):
 		res = dx.dispatch("fs.read", {"path": "a.txt"}, self.ctx(), call_id="c-noack")
 		self.assertEqual(res["error"]["code"], "desktop_unreachable")
 		self.assertEqual(len(self.sent_calls()), 1)
-		self.assertLessEqual(self.cache.blpop_timeouts[0], 10)
+		# polled in short slices (socket_timeout is 5 s) for the whole 10 s ack window
+		self.assertLessEqual(max(self.cache.blpop_timeouts), dx.POLL_SLICE_S)
+		self.assertAlmostEqual(self.cache.now - 1000.0, 10, delta=1.5)
 		cancels = self.cancels()
 		self.assertEqual(len(cancels), 1)
 		self.assertEqual(cancels[0]["user"], USER)
@@ -369,14 +418,12 @@ class TestDispatch(DesktopExecutorTestCase):
 		# never got a terminal message: server times out, and cancels
 		self.assertEqual(res["error"]["code"], "timeout")
 		self.assertEqual(self.cancels()[0]["message"]["reason"], "server_timeout")
-		# first wait is the ack phase (<=10s); after ack+approval the wait covers
-		# timeout (20s) + approval (90s) + grace (10s) = up to 120s, capped by 240s.
-		waits = self.cache.blpop_timeouts
-		self.assertLessEqual(waits[0], 10)  # ack phase
-		self.assertLessEqual(waits[1], 20)  # run phase before approval_pending
-		self.assertGreater(waits[2], 100)  # after the one extension
-		self.assertLessEqual(waits[2], 120)
-		self.assertLessEqual(waits[3], 120)  # a second approval_pending does not extend again
+		# Every slice is short; the run phase (20s) + one approval extension
+		# (90s + 10s grace) means the call is given ~120s after the ack, not more.
+		self.assertLessEqual(max(self.cache.blpop_timeouts), dx.POLL_SLICE_S)
+		elapsed = self.cache.now - 1000.0
+		self.assertGreater(elapsed, 115)
+		self.assertLess(elapsed, 125)
 
 	def test_s22_approval_timeout_from_desktop_is_passed_through(self):
 		self.cache.on_blpop = lambda: (
@@ -394,7 +441,8 @@ class TestDispatch(DesktopExecutorTestCase):
 		self.cache.on_blpop = lambda: self.desktop_submit("c-to", "ack")
 		res = dx.dispatch("fs.list", {"path": "."}, self.ctx(), call_id="c-to", timeout_ms=5000)
 		self.assertEqual(res["error"]["code"], "timeout")
-		self.assertLessEqual(self.cache.blpop_timeouts[1], 5)
+		self.assertLessEqual(max(self.cache.blpop_timeouts), dx.POLL_SLICE_S)
+		self.assertAlmostEqual(self.cache.now - 1000.0, 5, delta=1.5)
 
 	def test_timeout_ms_is_clamped_to_hard_cap(self):
 		dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-cap", timeout_ms=10**9)
@@ -473,7 +521,7 @@ class TestSubmit(DesktopExecutorTestCase):
 			dx._request_key("call-1"),
 			{"user": USER, "executor_id": EXEC_ID, "request": {"call_id": "call-1"}},
 		)
-		self.cache.zadd(dx._pending_key(EXEC_ID), {"call-1": dx._now_ms() + 60000})
+		self.cache.seed_zadd(dx._pending_key(EXEC_ID), {"call-1": dx._now_ms() + 60000})
 
 	def test_s25_other_user_gets_permission_error_and_nothing_is_pushed(self):
 		with self.assertRaises(frappe.PermissionError):

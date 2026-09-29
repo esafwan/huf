@@ -103,6 +103,10 @@ def _resolve_effective_model(agent_doc, model=None, provider=None):
 
 class AgentManager:
     """Manages the creation and execution of agents."""
+
+    # Class-level default so instances built without __init__ (tests) still work.
+    desktop_ctx = None
+
     def __init__(self, agent_name, file_handler=None, provider_override=None, model_override=None, conversation_id=None, desktop_ctx=None):
         self.agent_doc = frappe.get_cached_doc("Agent", agent_name)
         self.conversation_id = conversation_id
