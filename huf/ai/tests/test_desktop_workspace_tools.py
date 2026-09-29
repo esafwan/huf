@@ -392,16 +392,46 @@ class TestDesktopWorkspacePinnedUserBinding(IntegrationTestCase):
 	def test_pin_naming_a_different_user_than_the_owner_is_rejected(self):
 		frappe.set_user(self.owner)
 		with self.assertRaises(frappe.PermissionError):
-			desktop_workspace._validate_executor_context(self.exec_id, h.FP, self.owner, self.forged)
+			desktop_workspace._validate_executor_context(
+				self.exec_id, h.FP, self.owner, self.forged,
+				desktop_workspace.issue_pin_token(self.forged, self.exec_id, self.owner),
+			)
 
 	def test_administrator_session_is_accepted_only_for_the_owners_pin(self):
 		frappe.set_user("Administrator")
-		ctx = desktop_workspace._validate_executor_context(self.exec_id, h.FP, self.owner, self.honest)
+		ctx = desktop_workspace._validate_executor_context(
+			self.exec_id, h.FP, self.owner, self.honest,
+			desktop_workspace.issue_pin_token(self.honest, self.exec_id, self.owner),
+		)
 		self.assertEqual(ctx["user"], self.owner)
 		with self.assertRaises(frappe.PermissionError):
-			desktop_workspace._validate_executor_context(self.exec_id, h.FP, self.owner, self.forged)
+			desktop_workspace._validate_executor_context(
+				self.exec_id, h.FP, self.owner, self.forged,
+				desktop_workspace.issue_pin_token(self.forged, self.exec_id, self.owner),
+			)
+
+	def test_a_call_without_the_pinned_run_token_is_refused_even_for_the_honest_run(self):
+		"""N8: self-chosen ids (a flow, a procedure, a direct API call) are not enough."""
+		frappe.set_user(self.owner)
+		kwargs = dict(
+			path="a.txt",
+			_dx_executor_id=self.exec_id,
+			_dx_fingerprint=h.FP,
+			_dx_user=self.owner,
+			agent_run_id=self.honest,
+		)
+		for handler in (desktop_workspace.handle_read_file, desktop_workspace.handle_write_file):
+			with self.assertRaises(frappe.PermissionError):
+				handler.prepare(content="x", **kwargs)
+		token = desktop_workspace.issue_pin_token(self.honest, self.exec_id, self.owner)
+		prepared = desktop_workspace.handle_read_file.prepare(_dx_pin=token, **kwargs)
+		self.assertEqual(prepared["ctx"]["user"], self.owner)
+		self.assertNotIn("_dx_pin", prepared["params"])
 
 	def test_missing_agent_run_id_is_rejected(self):
 		frappe.set_user(self.owner)
 		with self.assertRaises(frappe.DoesNotExistError):
-			desktop_workspace._validate_executor_context(self.exec_id, h.FP, self.owner, None)
+			desktop_workspace._validate_executor_context(
+				self.exec_id, h.FP, self.owner, None,
+				desktop_workspace.issue_pin_token(None, self.exec_id, self.owner),
+			)

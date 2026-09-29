@@ -608,7 +608,7 @@ class TestDispatchBounds(DesktopExecutorTestCase):
 		self.publish.assert_not_called()
 
 	# H2 / N6: concurrency caps. Slots are lease-scored holders, not a counter.
-	FAR_FUTURE_MS = 9**12
+	FAR_FUTURE_MS = 10**14
 
 	def _fill_slots(self, key, n, expiry=None):
 		self.cache.seed_zadd(key, {f"holder-{i}": expiry or self.FAR_FUTURE_MS for i in range(n)})
