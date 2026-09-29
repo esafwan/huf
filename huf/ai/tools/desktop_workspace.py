@@ -4,18 +4,30 @@ on the user's local machine via Huf Desktop.
 
 All paths are workspace-relative POSIX strings. Parameter validation rejects
 absolute paths, backslashes, NUL bytes, and paths over 1024 chars. Total params
-must not exceed 512 KB. Results for read and exec operations are flagged as
-untrusted content.
+must not exceed 512 KB.
 
-The handlers verify the pinned executor context (_dx_executor_id, _dx_fingerprint,
-_dx_user) matches the current run, then call desktop_executor.dispatch with the
-run's pinned ctx {executor_id, fingerprint, user, label}.
+Every handler returns the ``desktop_executor.dispatch`` result UNCHANGED:
+``{ok, op, workspace, data | error{code,message}, truncated, duration_ms,
+untrusted_content, note}``. The error code and the untrusted marking (set for
+ws.info, fs.list, fs.read, fs.search, exec.run) therefore always reach the model.
+
+Identity (``agent_run_id``, ``conversation_id``, ``call_id``, ``_dx_*``) is pinned by
+``sdk_tools.create_function_tool`` and is never taken from the model: none of these
+appear in the tool schemas, and the pinning code overwrites anything the model sends.
+
+Each handler is split in two so blocking work stays off shared DB connections:
+``handler.prepare(**kwargs)`` validates parameters and the run context (reads the
+Agent Run) and MUST run on the loop/main thread; ``handler.execute(prepared)`` only
+talks to Redis and runs in ``asyncio.to_thread``. Calling ``handler(**kwargs)``
+does both in sequence (tests, plain callers).
 
 See PLAN.md §3.7-3.8 for limits and specifications.
 """
 
+import functools
 import json
-from typing import Any
+import re
+import unicodedata
 
 import frappe
 from frappe import _
@@ -40,12 +52,18 @@ def _validate_path(path: str) -> str:
 	- Paths longer than 1024 chars
 	- Empty paths
 
-	Converts to string to handle LLM stringification of numbers.
-	"""
-	path = str(path or "").strip()
+	- Leading/trailing whitespace, drive letters (C:), non-NFC text
 
-	if not path:
+	Converts to string to handle LLM stringification of numbers. This check is
+	best-effort; the desktop enforces the real workspace boundary.
+	"""
+	path = str(path or "")
+
+	if not path.strip():
 		frappe.throw(_("Path cannot be empty."))
+
+	if path != path.strip():
+		frappe.throw(_("Paths must not start or end with whitespace."))
 
 	if len(path) > MAX_PATH_LENGTH:
 		frappe.throw(
@@ -60,6 +78,12 @@ def _validate_path(path: str) -> str:
 
 	if "\0" in path:
 		frappe.throw(_("Paths with NUL bytes are not allowed."))
+
+	if re.match(r"^[A-Za-z]:", path):
+		frappe.throw(_("Drive-letter paths are not allowed. Use workspace-relative paths."))
+
+	if unicodedata.normalize("NFC", path) != path:
+		frappe.throw(_("Paths must be NFC-normalized."))
 
 	return path
 
@@ -101,10 +125,12 @@ def _validate_executor_context(
 ) -> dict:
 	"""Verify that the pinned executor context belongs to this run.
 
-	Reads the Agent Run to confirm:
+	Reads the Agent Run (main thread only: it touches the database) to confirm:
+	- the session user is the pinned user, or Administrator (the system context that
+	  drains queued runs; the run OWNER is what carries the identity)
+	- the run owner is _dx_user
 	- runtime_context.desktop.executor_id matches _dx_executor_id
-	- The run owner is _dx_user
-	- The session user is _dx_user
+	- runtime_context.desktop.user is the run owner
 
 	Returns the canonical dispatch ctx ``{executor_id, fingerprint, user, label}``
 	built from the run's pinned desktop context.
@@ -112,11 +138,14 @@ def _validate_executor_context(
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Desktop tools are not available in guest sessions."))
 
-	if frappe.session.user != _dx_user:
+	if frappe.session.user not in (_dx_user, "Administrator"):
 		frappe.throw(
 			_("Executor belongs to a different user."),
 			frappe.PermissionError,
 		)
+
+	if not agent_run_id:
+		frappe.throw(_("Agent run not found."), frappe.DoesNotExistError)
 
 	# Load the run to verify ownership and executor context
 	try:
@@ -143,187 +172,117 @@ def _validate_executor_context(
 	if pinned_executor_id != _dx_executor_id:
 		frappe.throw(_("Executor ID mismatch with the pinned context."))
 
+	if desktop_ctx.get("user") != run.owner:
+		frappe.throw(
+			_("The pinned desktop user is not the owner of this run."),
+			frappe.PermissionError,
+		)
+
 	# Canonical ctx for desktop_executor.dispatch: {executor_id, fingerprint, user, label}.
 	# The fingerprint is the one pinned on the run at send time (not the live one).
 	return {
 		"executor_id": pinned_executor_id,
 		"fingerprint": desktop_ctx.get("fingerprint") or _dx_fingerprint or None,
-		"user": _dx_user,
+		"user": run.owner,
 		"label": desktop_ctx.get("label"),
 	}
 
 
 def _import_dispatch_lazily():
-	"""Import dispatch lazily so tests can mock it even before desktop_executor.py lands."""
+	"""Import dispatch lazily (kept as a seam so tests can substitute it)."""
+	from huf.ai import desktop_executor
+
+	return desktop_executor.dispatch
+
+
+# Identity arguments: pinned server-side, never model-controlled.
+_IDENTITY_KEYS = (
+	"_dx_executor_id",
+	"_dx_fingerprint",
+	"_dx_user",
+	"agent_run_id",
+	"call_id",
+	"conversation_id",
+)
+
+
+def _desktop_tool(op: str):
+	"""Turn ``build(**tool_params) -> params | (params, timeout_ms)`` into a handler.
+
+	The handler validates in ``prepare`` (main thread, may read the DB) and sends in
+	``execute`` (thread-safe, Redis only). It returns the dispatch result unchanged.
+	"""
+
+	def decorator(build):
+		def prepare(**kwargs):
+			ident = {key: kwargs.pop(key, None) for key in _IDENTITY_KEYS}
+			built = build(**kwargs)
+			params, timeout_ms = built if isinstance(built, tuple) else (built, MAX_FS_TIMEOUT_MS)
+			_validate_params_size(params)
+			dx_ctx = _validate_executor_context(
+				ident["_dx_executor_id"],
+				ident["_dx_fingerprint"],
+				ident["_dx_user"],
+				ident["agent_run_id"],
+			)
+			return {
+				"op": op,
+				"params": params,
+				"ctx": dx_ctx,
+				"call_id": ident["call_id"],
+				"conversation_id": ident["conversation_id"],
+				"agent_run_id": ident["agent_run_id"],
+				"timeout_ms": timeout_ms,
+			}
+
+		def execute(prepared):
+			return _import_dispatch_lazily()(**prepared)
+
+		@functools.wraps(build)
+		def handler(**kwargs):
+			return execute(prepare(**kwargs))
+
+		handler.prepare = prepare
+		handler.execute = execute
+		return handler
+
+	return decorator
+
+
+def _as_int(value, name):
+	if isinstance(value, bool):
+		return int(value)
+	if isinstance(value, int):
+		return value
 	try:
-		from huf.ai import desktop_executor
-		return desktop_executor.dispatch
-	except ImportError:
-		# H3 hasn't implemented desktop_executor.py yet; stub for testing
-		def _stub_dispatch(op, params, ctx, call_id, conversation_id, agent_run_id, timeout_ms):
-			raise frappe.ValidationError(_("Desktop executor not yet implemented."))
-		return _stub_dispatch
+		return int(value)
+	except (ValueError, TypeError):
+		frappe.throw(_("{0} must be an integer.").format(name))
 
 
-def handle_workspace_info(
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Return workspace info: label, mode, platform, exec availability, top-level listing.
-
-	No parameters. Returns untrusted_content=False (metadata only).
-	"""
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="ws.info",
-		params={},
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	# Unwrap result from dispatch, which returns {ok, data|error, ...}
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+@_desktop_tool("ws.info")
+def handle_workspace_info(**_ignored) -> dict:
+	"""Workspace info: label, mode, platform, exec availability, top-level listing. No parameters."""
+	return {}
 
 
-def handle_list_files(
-	path: str = ".",
-	depth: int = 1,
-	include_hidden: bool = False,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""List files in a directory.
+@_desktop_tool("fs.list")
+def handle_list_files(path: str = ".", depth: int = 1, include_hidden: bool = False, **_ignored):
+	"""List files in a directory (depth 1-3, default 1)."""
+	depth = max(1, min(3, _as_int(depth, "depth")))
+	return {"path": _validate_path(path), "depth": depth, "include_hidden": bool(include_hidden)}
 
-	Args:
-		path: workspace-relative path (default ".")
-		depth: recursion depth, 1-3 (default 1)
-		include_hidden: include hidden files (default False)
-	"""
-	# Validate parameters
+
+@_desktop_tool("fs.read")
+def handle_read_file(path: str, offset: int = 0, limit: int = 2000, **_ignored):
+	"""Read file content: ``offset`` (>= 0) and ``limit`` (1-2000) count lines."""
 	path = _validate_path(path)
-
-	if not isinstance(depth, int):
-		try:
-			depth = int(depth)
-		except (ValueError, TypeError):
-			frappe.throw(_("depth must be an integer."))
-
-	if depth < 1 or depth > 3:
-		depth = max(1, min(3, depth))  # Clamp to 1-3
-
-	include_hidden = bool(include_hidden)
-
-	params = {"path": path, "depth": depth, "include_hidden": include_hidden}
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.list",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+	offset = max(0, _as_int(offset, "offset"))
+	limit = max(1, min(2000, _as_int(limit, "limit")))
+	return {"path": path, "offset": offset, "limit": limit}
 
 
-def handle_read_file(
-	path: str,
-	offset: int = 0,
-	limit: int = 2000,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Read file content.
-
-	Args:
-		path: workspace-relative path (required)
-		offset: line offset (default 0)
-		limit: max lines to return (default 2000)
-
-	Returns untrusted_content=True (file content).
-	"""
-	# Validate parameters
-	path = _validate_path(path)
-
-	if not isinstance(offset, int):
-		try:
-			offset = int(offset)
-		except (ValueError, TypeError):
-			frappe.throw(_("offset must be an integer."))
-
-	if not isinstance(limit, int):
-		try:
-			limit = int(limit)
-		except (ValueError, TypeError):
-			frappe.throw(_("limit must be an integer."))
-
-	offset = max(0, offset)
-	limit = max(1, min(2000, limit))  # Clamp to 1-2000
-
-	params = {"path": path, "offset": offset, "limit": limit}
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.read",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		error_result = {"error": result.get("error", {}).get("message", "Unknown error")}
-		error_result["untrusted_content"] = False
-		return error_result
-
-	data = result.get("data", {})
-	data["untrusted_content"] = True
-	return data
-
-
+@_desktop_tool("fs.search")
 def handle_search_files(
 	query: str,
 	path: str = ".",
@@ -331,412 +290,114 @@ def handle_search_files(
 	glob: str = None,
 	case_sensitive: bool = False,
 	max_results: int = 100,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Search files by name or content.
-
-	Args:
-		query: search term (required)
-		path: workspace-relative path to search in (default ".")
-		mode: "name" or "content" (default "name")
-		glob: glob pattern to filter files
-		case_sensitive: case-sensitive search (default False)
-		max_results: max results to return (default 100)
-	"""
-	# Validate parameters
+	**_ignored,
+):
+	"""Search files by name or content (max_results clamped to 1-100)."""
 	query = str(query or "").strip()
 	if not query:
 		frappe.throw(_("search query cannot be empty."))
-
 	path = _validate_path(path)
-
 	if mode not in ("name", "content"):
-		mode = "name"  # Default to name search
-
-	if glob:
-		glob = str(glob).strip()
-
-	case_sensitive = bool(case_sensitive)
-
-	if not isinstance(max_results, int):
-		try:
-			max_results = int(max_results)
-		except (ValueError, TypeError):
-			frappe.throw(_("max_results must be an integer."))
-
-	max_results = max(1, min(100, max_results))  # Clamp to 1-100
-
+		mode = "name"
 	params = {
 		"query": query,
 		"path": path,
 		"mode": mode,
-		"case_sensitive": case_sensitive,
-		"max_results": max_results,
+		"case_sensitive": bool(case_sensitive),
+		"max_results": max(1, min(100, _as_int(max_results, "max_results"))),
 	}
 	if glob:
-		params["glob"] = glob
-
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.search",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		error_result = {"error": result.get("error", {}).get("message", "Unknown error")}
-		error_result["untrusted_content"] = False
-		return error_result
-
-	data = result.get("data", {})
-	data["untrusted_content"] = True
-	return data
+		glob = str(glob).strip()
+		if glob:
+			params["glob"] = glob
+	return params
 
 
+@_desktop_tool("fs.write")
 def handle_write_file(
-	path: str,
-	content: str,
-	mode: str = "overwrite",
-	expected_sha256: str = None,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Write or append to a file.
-
-	Args:
-		path: workspace-relative path (required)
-		content: file content (required)
-		mode: "overwrite" or "create" or "append" (default "overwrite")
-		expected_sha256: expected file SHA256 before write (for conflict detection)
-	"""
-	# Validate parameters
+	path: str, content: str, mode: str = "overwrite", expected_sha256: str = None, **_ignored
+):
+	"""Write or append to a file (content at most 256 KB)."""
 	path = _validate_path(path)
-
 	content = str(content or "")
 	if len(content.encode("utf-8")) > MAX_WRITE_CONTENT_BYTES:
 		frappe.throw(
 			_("Content exceeds maximum size of {0} KB.").format(MAX_WRITE_CONTENT_BYTES // 1024)
 		)
-
 	if mode not in ("overwrite", "create", "append"):
-		mode = "overwrite"  # Default
-
-	if expected_sha256:
-		expected_sha256 = str(expected_sha256).strip()
-
+		mode = "overwrite"
 	params = {"path": path, "content": content, "mode": mode}
 	if expected_sha256:
-		params["expected_sha256"] = expected_sha256
-
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.write",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+		params["expected_sha256"] = str(expected_sha256).strip()
+	return params
 
 
+@_desktop_tool("fs.edit")
 def handle_edit_file(
 	path: str,
 	old_text: str,
 	new_text: str,
 	replace_all: bool = False,
 	expected_sha256: str = None,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Edit file content with exact text replacement.
-
-	Args:
-		path: workspace-relative path (required)
-		old_text: text to find and replace (required)
-		new_text: replacement text (required)
-		replace_all: replace all occurrences (default False, replace only first)
-		expected_sha256: expected file SHA256 before edit (for conflict detection)
-	"""
-	# Validate parameters
+	**_ignored,
+):
+	"""Edit file content with exact text replacement."""
 	path = _validate_path(path)
-
 	old_text = str(old_text or "")
 	new_text = str(new_text or "")
-
 	if len(old_text.encode("utf-8")) > MAX_WRITE_CONTENT_BYTES:
 		frappe.throw(_("old_text exceeds maximum size."))
 	if len(new_text.encode("utf-8")) > MAX_WRITE_CONTENT_BYTES:
 		frappe.throw(_("new_text exceeds maximum size."))
-
-	replace_all = bool(replace_all)
-
+	params = {
+		"path": path,
+		"old_text": old_text,
+		"new_text": new_text,
+		"replace_all": bool(replace_all),
+	}
 	if expected_sha256:
-		expected_sha256 = str(expected_sha256).strip()
-
-	params = {"path": path, "old_text": old_text, "new_text": new_text, "replace_all": replace_all}
-	if expected_sha256:
-		params["expected_sha256"] = expected_sha256
-
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.edit",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+		params["expected_sha256"] = str(expected_sha256).strip()
+	return params
 
 
-def handle_make_directory(
-	path: str,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Create a directory.
-
-	Args:
-		path: workspace-relative path (required)
-	"""
-	# Validate parameters
-	path = _validate_path(path)
-
-	params = {"path": path}
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.mkdir",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+@_desktop_tool("fs.mkdir")
+def handle_make_directory(path: str, **_ignored):
+	"""Create a directory."""
+	return {"path": _validate_path(path)}
 
 
-def handle_move_path(
-	source: str,
-	destination: str,
-	overwrite: bool = False,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Move or rename a file or directory.
-
-	Args:
-		source: workspace-relative source path (required)
-		destination: workspace-relative destination path (required)
-		overwrite: overwrite destination if it exists (default False)
-	"""
-	# Validate parameters
-	source = _validate_path(source)
-	destination = _validate_path(destination)
-
-	overwrite = bool(overwrite)
-
-	params = {"source": source, "destination": destination, "overwrite": overwrite}
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.move",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+@_desktop_tool("fs.move")
+def handle_move_path(source: str, destination: str, overwrite: bool = False, **_ignored):
+	"""Move or rename a file or directory."""
+	return {
+		"source": _validate_path(source),
+		"destination": _validate_path(destination),
+		"overwrite": bool(overwrite),
+	}
 
 
-def handle_delete_path(
-	path: str,
-	recursive: bool = False,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Move a file or directory to the OS Trash.
-
-	Args:
-		path: workspace-relative path (required)
-		recursive: recursively trash directories (default False)
-	"""
-	# Validate parameters
-	path = _validate_path(path)
-
-	recursive = bool(recursive)
-
-	params = {"path": path, "recursive": recursive}
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	result = dispatch(
-		op="fs.trash",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=MAX_FS_TIMEOUT_MS,
-	)
-
-	if not result.get("ok"):
-		return {"error": result.get("error", {}).get("message", "Unknown error")}
-
-	return result.get("data", {})
+@_desktop_tool("fs.trash")
+def handle_delete_path(path: str, recursive: bool = False, **_ignored):
+	"""Move a file or directory to the OS Trash."""
+	return {"path": _validate_path(path), "recursive": bool(recursive)}
 
 
+@_desktop_tool("exec.run")
 def handle_run_command(
 	command: str,
 	cwd: str = ".",
 	timeout_seconds: int = DEFAULT_EXEC_TIMEOUT_SECONDS,
-	_dx_executor_id: str = None,
-	_dx_fingerprint: str = None,
-	_dx_user: str = None,
-	agent_run_id: str = None,
-	call_id: str = None,
-	conversation_id: str = None,
-	**kwargs
-) -> dict:
-	"""Run a shell command in the workspace.
-
-	Args:
-		command: shell command to execute (required)
-		cwd: workspace-relative working directory (default ".")
-		timeout_seconds: execution timeout in seconds, clamped 1-120 (default 60)
-
-	Returns untrusted_content=True (command output).
-	"""
-	# Validate parameters
+	**_ignored,
+):
+	"""Run a shell command in the workspace (timeout_seconds clamped to 1-120)."""
 	command = str(command or "").strip()
 	if not command:
 		frappe.throw(_("command cannot be empty."))
-
 	cwd = _validate_path(cwd)
-
-	if not isinstance(timeout_seconds, (int, float)):
-		try:
-			timeout_seconds = int(timeout_seconds)
-		except (ValueError, TypeError):
-			frappe.throw(_("timeout_seconds must be an integer."))
-
-	timeout_seconds = max(MIN_EXEC_TIMEOUT_SECONDS, min(MAX_EXEC_TIMEOUT_SECONDS, int(timeout_seconds)))
-
-	params = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds}
-	_validate_params_size(params)
-
-	# Validate executor context
-	dx_ctx = _validate_executor_context(_dx_executor_id, _dx_fingerprint, _dx_user, agent_run_id)
-
-	dispatch = _import_dispatch_lazily()
-
-	# Exec timeout is longer than fs timeout since it waits for command completion
-	exec_timeout_ms = timeout_seconds * 1000 + 5000  # Add 5s buffer
-
-	result = dispatch(
-		op="exec.run",
-		params=params,
-		ctx=dx_ctx,
-		call_id=call_id,
-		conversation_id=conversation_id,
-		agent_run_id=agent_run_id,
-		timeout_ms=exec_timeout_ms,
+	timeout_seconds = max(
+		MIN_EXEC_TIMEOUT_SECONDS,
+		min(MAX_EXEC_TIMEOUT_SECONDS, _as_int(timeout_seconds, "timeout_seconds")),
 	)
-
-	if not result.get("ok"):
-		error_result = {"error": result.get("error", {}).get("message", "Unknown error")}
-		error_result["untrusted_content"] = False
-		return error_result
-
-	data = result.get("data", {})
-	data["untrusted_content"] = True
-	return data
+	params = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds}
+	# The desktop needs the command's own timeout plus a buffer.
+	return params, timeout_seconds * 1000 + 5000

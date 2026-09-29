@@ -1193,24 +1193,38 @@ def _desktop_runtime_context(desktop_ctx):
     }
 
 
-def _desktop_ctx_from_runtime_context(context):
+def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owner=None):
     """Re-resolve a pinned desktop ctx in the worker.
 
-    Returns the pinned ctx (with its original fingerprint, so a workspace switch
-    is still detected by the tools) only if the lease is still live and still
-    owned by the pinned user; otherwise None (run proceeds without desktop tools).
+    The identity comes from the run OWNER, never from the session user (a queued run
+    drained by the stale-run sweeper has session user Administrator). The pin is
+    honoured only if ALL hold, otherwise the run proceeds without desktop tools:
+
+    * ``pinned.user`` equals the run owner (Frappe sets ``owner``; a user cannot
+      forge it, unlike ``runtime_context`` which a Huf User can write on insert);
+    * the conversation, when known, is owned by the same user;
+    * the lease is still live and owned by that user.
+
+    The returned ctx keeps the ORIGINAL pinned fingerprint, so a workspace switch
+    after the send is still detected.
     """
     pinned = (context or {}).get("desktop")
     if not pinned or not isinstance(pinned, dict):
         return None
+    if not run_owner or pinned.get("user") != run_owner:
+        frappe.logger("huf").warning("Dropping desktop pin: pinned user is not the run owner")
+        return None
+    if conversation_owner and conversation_owner != run_owner:
+        frappe.logger("huf").warning("Dropping desktop pin: conversation belongs to another user")
+        return None
     try:
         from huf.ai.desktop_executor import resolve_desktop_ctx
 
-        live = resolve_desktop_ctx(pinned.get("executor_id"), user=pinned.get("user"))
+        live = resolve_desktop_ctx(pinned.get("executor_id"), user=run_owner)
     except Exception as exc:
         frappe.logger("huf").warning(f"desktop ctx re-resolution failed: {exc!s}")
         return None
-    if not live:
+    if not live or live.get("user") != run_owner:
         return None
     return {**live, "fingerprint": pinned.get("fingerprint") or live.get("fingerprint")}
 
@@ -1447,6 +1461,12 @@ def run_agent_sync(
         )
         if existing_run_name:
             existing_run = frappe.get_doc("Agent Run", existing_run_name)
+            existing_pin = (
+                frappe.parse_json(existing_run.runtime_context or "{}").get("desktop") or {}
+            )
+            if desktop_status is not None and existing_pin.get("executor_id") != desktop_executor_id:
+                # The replayed run was never pinned to this executor: do not claim tools.
+                desktop_status = {"available": False, "reason": "run_not_pinned"}
             return _with_desktop_status({
                 "success": True,
                 "queued": existing_run.status in ("Queued", "Started"),
@@ -2822,6 +2842,16 @@ def _drain_run(run_doc, lock_key: str):
         heartbeat.stop()
 
 
+def _conversation_owner(conversation_id):
+    """Owner of an Agent Conversation, or None when unknown (never raises)."""
+    if not conversation_id:
+        return None
+    try:
+        return frappe.db.get_value("Agent Conversation", conversation_id, "owner")
+    except Exception:
+        return None
+
+
 def _build_execution_kwargs(run_doc, context: dict):
     """Reconstruct execution kwargs from the persisted run doc + runtime context."""
     return {
@@ -2842,7 +2872,11 @@ def _build_execution_kwargs(run_doc, context: dict):
         "prompt_cache_options": context.get("prompt_cache_options"),
         "files": context.get("files"),
         "skip_user_message": context.get("skip_user_message", False),
-        "desktop_ctx": _desktop_ctx_from_runtime_context(context),
+        "desktop_ctx": _desktop_ctx_from_runtime_context(
+            context,
+            run_owner=getattr(run_doc, "owner", None),
+            conversation_owner=_conversation_owner(getattr(run_doc, "conversation", None)),
+        ),
     }
 
 

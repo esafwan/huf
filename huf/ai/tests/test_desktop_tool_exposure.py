@@ -13,7 +13,9 @@ Run with:
 
 import asyncio
 import json
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import frappe
@@ -206,6 +208,126 @@ class TestDesktopToolExposure(unittest.TestCase):
 
 		self.assertEqual(json.loads(out), {"ok": True})
 		self.assertEqual(captured["_dx_executor_id"], LIVE["executor_id"])
-		self.assertEqual(captured["_dx_fingerprint"], LIVE["fingerprint"])
+		# M3: the fingerprint is the one PINNED on the run at send time, not the live lease's.
+		self.assertEqual(captured["_dx_fingerprint"], CTX["fingerprint"])
+		self.assertNotEqual(captured["_dx_fingerprint"], LIVE["fingerprint"])
 		self.assertEqual(captured["_dx_user"], LIVE["user"])
 		self.assertTrue(to_thread.called)
+
+	def test_pinned_fingerprint_falls_back_to_live_when_ctx_has_none(self):
+		captured = {}
+
+		def fake_handler(**kwargs):
+			captured.update(kwargs)
+			return {"ok": True}
+
+		agent = self._make_agent(self.tool_docs)
+		with _PATCH_LIVE[0], _PATCH_LIVE[1], mock.patch(
+			"huf.ai.tools.desktop_workspace.handle_list_files", fake_handler
+		):
+			tools = create_agent_tools(agent, desktop_ctx={**CTX, "fingerprint": None})
+			tool = next(t for t in tools if t.name == "desktop_list_files")
+			asyncio.run(tool.on_invoke_tool(None, "{}"))
+		self.assertEqual(captured["_dx_fingerprint"], LIVE["fingerprint"])
+
+	# H1: identity is pinned server-side
+	def _invoke_with_run_ctx(self, evil_args, run_ctx, tool_call_id="call_abc123", handler=None):
+		captured = {}
+
+		def fake_handler(**kwargs):
+			captured.update(kwargs)
+			return {"ok": True}
+
+		agent = self._make_agent(self.tool_docs)
+		with _PATCH_LIVE[0], _PATCH_LIVE[1], mock.patch(
+			"huf.ai.tools.desktop_workspace.handle_list_files", handler or fake_handler
+		):
+			tools = create_agent_tools(agent, desktop_ctx=dict(CTX))
+			tool = next(t for t in tools if t.name == "desktop_list_files")
+			tool_ctx = SimpleNamespace(context=run_ctx, tool_call_id=tool_call_id)
+			asyncio.run(tool.on_invoke_tool(tool_ctx, json.dumps(evil_args)))
+		return captured
+
+	def test_llm_supplied_run_identity_is_ignored(self):
+		from huf.ai.desktop_executor import derive_call_id
+
+		captured = self._invoke_with_run_ctx(
+			{
+				"path": ".",
+				"agent_run_id": "AR-foreign-run",
+				"conversation_id": "CONV-foreign",
+				"call_id": "call-chosen-by-the-llm",
+			},
+			{"agent_run_id": "AR-real", "conversation_id": "CONV-real"},
+		)
+		self.assertEqual(captured["agent_run_id"], "AR-real")
+		self.assertEqual(captured["conversation_id"], "CONV-real")
+		self.assertEqual(captured["call_id"], derive_call_id("AR-real", "call_abc123"))
+		self.assertNotIn("chosen", captured["call_id"])
+
+	def test_llm_run_identity_dropped_when_the_run_context_has_none(self):
+		captured = self._invoke_with_run_ctx(
+			{"path": ".", "agent_run_id": "AR-foreign-run", "call_id": "mine"}, {}
+		)
+		self.assertNotIn("agent_run_id", captured)
+		self.assertNotIn("call_id", captured)
+
+	def test_call_id_is_deterministic_per_run_and_tool_call(self):
+		a = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-1"}, "call_x")
+		b = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-1"}, "call_x")
+		c = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-2"}, "call_x")
+		d = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-1"}, "call_y")
+		self.assertEqual(a["call_id"], b["call_id"])
+		self.assertEqual(len({a["call_id"], c["call_id"], d["call_id"]}), 3)
+
+	def test_derive_call_id_is_bounded_and_wire_safe(self):
+		from huf.ai.desktop_executor import derive_call_id
+
+		self.assertEqual(derive_call_id("AR-1", "call_1"), "AR-1:call_1")
+		long_id = derive_call_id("AR-1", "x" * 500)
+		self.assertLessEqual(len(long_id), 200)
+		self.assertEqual(long_id, derive_call_id("AR-1", "x" * 500))
+		self.assertNotEqual(long_id, derive_call_id("AR-2", "x" * 500))
+		self.assertLessEqual(len(derive_call_id("AR-1", "weird id/with spaces")), 200)
+
+	# M5: DB work on the loop thread, only the wait in the worker thread
+	def test_prepare_runs_on_the_loop_thread_and_only_execute_in_a_worker(self):
+		seen = {}
+		main = threading.get_ident()
+
+		def handler(**kwargs):  # pragma: no cover - must not be used
+			raise AssertionError("prepare/execute must be used instead")
+
+		handler.prepare = lambda **kw: (seen.__setitem__("prepare", threading.get_ident()), {"p": kw})[1]
+		handler.execute = lambda prepared: (seen.__setitem__("execute", threading.get_ident()), {"ok": True})[1]
+
+		async def run():
+			seen["loop"] = threading.get_ident()
+			return await self._async_invoke(handler)
+
+		out = asyncio.run(run())
+		self.assertEqual(json.loads(out), {"ok": True})
+		self.assertEqual(seen["prepare"], seen["loop"])
+		self.assertNotEqual(seen["execute"], seen["loop"])
+		self.assertEqual(main, seen["loop"])
+
+	async def _async_invoke(self, handler):
+		agent = self._make_agent(self.tool_docs)
+		with _PATCH_LIVE[0], _PATCH_LIVE[1], mock.patch(
+			"huf.ai.tools.desktop_workspace.handle_list_files", handler
+		):
+			tools = create_agent_tools(agent, desktop_ctx=dict(CTX))
+			tool = next(t for t in tools if t.name == "desktop_list_files")
+			return await tool.on_invoke_tool(None, "{}")
+
+	def test_real_handlers_expose_prepare_and_execute(self):
+		from huf.ai.tools import desktop_workspace as dw
+
+		for name in (
+			"handle_workspace_info", "handle_list_files", "handle_read_file", "handle_search_files",
+			"handle_write_file", "handle_edit_file", "handle_make_directory", "handle_move_path",
+			"handle_delete_path", "handle_run_command",
+		):
+			fn = getattr(dw, name)
+			self.assertTrue(callable(fn.prepare), name)
+			self.assertTrue(callable(fn.execute), name)

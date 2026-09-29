@@ -87,6 +87,29 @@ def _merge_run_context(args_dict: dict, ctx) -> dict:
     return args_dict
 
 
+def _pin_run_identity(args_dict: dict, ctx) -> dict:
+    """Overwrite (never default) the run identity args from the server-side run context.
+
+    Used by tools that must not trust the model for who/what run they act on
+    (Desktop Workspace tools): ``agent_run_id`` and ``conversation_id`` come only from
+    the run context, and ``call_id`` is derived deterministically from the run and the
+    SDK ``tool_call_id`` so a redelivered or retried call dedupes. Anything the model
+    sent for these keys is discarded.
+    """
+    from huf.ai.desktop_executor import derive_call_id
+
+    huf_ctx = _frappe_run_context_dict(ctx)
+    for key in ("agent_run_id", "conversation_id"):
+        args_dict.pop(key, None)
+        if huf_ctx.get(key):
+            args_dict[key] = huf_ctx[key]
+    args_dict.pop("call_id", None)
+    tool_call_id = getattr(ctx, "tool_call_id", None)
+    if tool_call_id and args_dict.get("agent_run_id"):
+        args_dict["call_id"] = derive_call_id(args_dict["agent_run_id"], tool_call_id)
+    return args_dict
+
+
 # _check_tool_permission moved to huf.ai.tool_invocation.check_tool_permission
 # (T-10) so the deterministic tool path shares the same guest/mutating-type
 # gate; imported above as _check_tool_permission to keep this call site
@@ -164,9 +187,11 @@ def _build_desktop_workspace_tools(function_docs, desktop_ctx) -> list:
     if not live or not live.get("executor_id") or not live.get("user"):
         return []
 
+    # The fingerprint is the one pinned on the run at send time, NOT the live lease's:
+    # a queued run sent under workspace A must not silently operate on workspace B.
     extra_args = {
         "_dx_executor_id": live["executor_id"],
-        "_dx_fingerprint": live.get("fingerprint") or "",
+        "_dx_fingerprint": desktop_ctx.get("fingerprint") or live.get("fingerprint") or "",
         "_dx_user": live["user"],
     }
 
@@ -186,6 +211,7 @@ def _build_desktop_workspace_tools(function_docs, desktop_ctx) -> list:
                 extra_args=dict(extra_args),
                 tool_type=function_doc.types,
                 blocking=True,
+                pin_run_context=True,
             )
             if tool:
                 built.append(tool)
@@ -548,6 +574,7 @@ def create_function_tool(
     tool_type: str = None,
     allowed_for_guest: bool = False,
     blocking: bool = False,
+    pin_run_context: bool = False,
 ) -> FunctionTool:
     """
     Create a FunctionTool for Huf Tool functions
@@ -563,7 +590,14 @@ def create_function_tool(
             functions that perform a bounded blocking wait (e.g. the
             client-side tool round trip) would otherwise stall the event
             loop for the whole run; running them on a worker thread lets
-            other concurrent work keep going while this call waits.
+            other concurrent work keep going while this call waits. If the
+            function exposes ``prepare`` / ``execute`` attributes (Desktop
+            Workspace handlers), ``prepare`` runs on the loop thread (it may read
+            the database) and only ``execute`` runs in the worker thread, so the
+            shared DB connection is never used from two threads.
+        pin_run_context: When True, ``agent_run_id`` / ``conversation_id`` /
+            ``call_id`` are taken from the server-side run context and the SDK
+            tool_call_id and OVERWRITE anything the model passed.
 
     Returns:
         FunctionTool: Function tool
@@ -594,6 +628,8 @@ def create_function_tool(
                 args_dict = json.loads(args_json or "{}")
 
                 _merge_run_context(args_dict, ctx)
+                if pin_run_context:
+                    _pin_run_identity(args_dict, ctx)
 
                 if _extra_args:
                     args_dict.update(_extra_args)
@@ -650,7 +686,15 @@ def create_function_tool(
                     # seconds) would otherwise stall this whole run. Mirrors the
                     # asyncio.to_thread precedent in huf.ai.handlers.media (TTS
                     # via litellm.speech).
-                    result = await asyncio.to_thread(_function, **call_kwargs)
+                    prepare = getattr(_function, "prepare", None)
+                    execute = getattr(_function, "execute", None)
+                    if callable(prepare) and callable(execute):
+                        # DB work (validation, run lookup) here on the loop thread;
+                        # only the Redis wait goes to a worker thread.
+                        prepared = prepare(**call_kwargs)
+                        result = await asyncio.to_thread(execute, prepared)
+                    else:
+                        result = await asyncio.to_thread(_function, **call_kwargs)
                 else:
                     result = _function(**call_kwargs)
 

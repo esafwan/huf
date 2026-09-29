@@ -83,6 +83,7 @@ class TestRuntimeContextRoundTrip(unittest.TestCase):
 		resolve.return_value = {**CTX, "fingerprint": "fp-now"}
 		run_doc = MagicMock(agent="A", conversation="C", prompt="hi", provider="P", model="m")
 		run_doc.name = "AR-1"
+		run_doc.owner = CTX["user"]
 		kwargs = ai._build_execution_kwargs(run_doc, context)
 		resolve.assert_called_once_with("exec-1", user="u@example.com")
 		# Pinned fingerprint is kept so a workspace switch is still detectable.
@@ -92,6 +93,7 @@ class TestRuntimeContextRoundTrip(unittest.TestCase):
 	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=None)
 	def test_queued_worker_expired_lease_gives_no_ctx(self, _resolve):
 		run_doc = MagicMock(agent="A", conversation="C", prompt="hi", provider="P", model="m")
+		run_doc.owner = CTX["user"]
 		kwargs = ai._build_execution_kwargs(run_doc, {"desktop": ai._desktop_runtime_context(CTX)})
 		self.assertIsNone(kwargs["desktop_ctx"])
 
@@ -101,6 +103,55 @@ class TestRuntimeContextRoundTrip(unittest.TestCase):
 		kwargs = ai._build_execution_kwargs(run_doc, {})
 		self.assertIsNone(kwargs["desktop_ctx"])
 		resolve.assert_not_called()
+
+
+class TestWorkerPinVerification(unittest.TestCase):
+	"""M1 / M2: the worker trusts the run owner, never the session user or the JSON alone."""
+
+	def _run_doc(self, owner):
+		run_doc = MagicMock(agent="A", conversation="C", prompt="hi", provider="P", model="m")
+		run_doc.owner = owner
+		return run_doc
+
+	@patch("huf.ai.agent_integration._conversation_owner", return_value=None)
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	def test_owner_mismatch_drops_the_tools_without_resolving_the_lease(self, resolve, _conv):
+		context = {"desktop": ai._desktop_runtime_context(CTX)}
+		kwargs = ai._build_execution_kwargs(self._run_doc("attacker@example.com"), context)
+		self.assertIsNone(kwargs["desktop_ctx"])
+		resolve.assert_not_called()
+
+	@patch("huf.ai.agent_integration._conversation_owner", return_value=None)
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx")
+	def test_missing_owner_drops_the_tools(self, resolve, _conv):
+		context = {"desktop": ai._desktop_runtime_context(CTX)}
+		self.assertIsNone(ai._build_execution_kwargs(self._run_doc(None), context)["desktop_ctx"])
+		resolve.assert_not_called()
+
+	@patch("huf.ai.agent_integration._conversation_owner", return_value="victim@example.com")
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	def test_conversation_owned_by_someone_else_drops_the_tools(self, resolve, _conv):
+		context = {"desktop": ai._desktop_runtime_context(CTX)}
+		kwargs = ai._build_execution_kwargs(self._run_doc(CTX["user"]), context)
+		self.assertIsNone(kwargs["desktop_ctx"])
+		resolve.assert_not_called()
+
+	@patch("huf.ai.agent_integration._conversation_owner", return_value=CTX["user"])
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value={**CTX, "user": "someone-else@example.com"})
+	def test_lease_owned_by_another_user_drops_the_tools(self, resolve, _conv):
+		context = {"desktop": ai._desktop_runtime_context(CTX)}
+		self.assertIsNone(ai._build_execution_kwargs(self._run_doc(CTX["user"]), context)["desktop_ctx"])
+
+	@patch("huf.ai.agent_integration._conversation_owner", return_value=CTX["user"])
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	def test_sweeper_drain_as_administrator_resolves_from_the_run_owner(self, resolve, _conv):
+		"""Session user is Administrator (stale-run sweeper); the lease is resolved for the OWNER."""
+		context = {"desktop": ai._desktop_runtime_context(CTX)}
+		with patch.object(ai.frappe, "session", MagicMock(user="Administrator")):
+			kwargs = ai._build_execution_kwargs(self._run_doc(CTX["user"]), context)
+		resolve.assert_called_once_with("exec-1", user=CTX["user"])
+		self.assertEqual(kwargs["desktop_ctx"]["user"], CTX["user"])
+		self.assertEqual(kwargs["desktop_ctx"]["fingerprint"], "fp1")
 
 
 class TestAgentManagerPassesCtx(unittest.TestCase):
