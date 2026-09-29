@@ -231,7 +231,7 @@ def _validate_executor_context(
 	from huf.ai.desktop_executor import verify_pin
 
 	if verify_pin(desktop_ctx, run.get("conversation") or ""):
-		ctx["origin"] = desktop_ctx.get("origin") or "remote"
+		ctx["origin"] = desktop_ctx.get("origin") if desktop_ctx.get("origin") in ("desktop", "remote") else "remote"
 		if desktop_ctx.get("agent_policy"):
 			ctx["agent_policy"] = desktop_ctx["agent_policy"]
 		if desktop_ctx.get("device_id"):

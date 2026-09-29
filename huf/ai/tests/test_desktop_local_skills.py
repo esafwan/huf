@@ -21,6 +21,7 @@ import frappe
 
 from huf.ai import agent_integration as ai
 from huf.ai import desktop_executor as dx
+from huf.ai.desktop_policy import default_policy
 from huf.ai.sdk_tools import create_agent_tools
 from huf.ai.tests import desktop_test_helpers as h
 from huf.ai.tools import desktop_local as dl
@@ -31,6 +32,12 @@ from huf.ai.tools._registry import (
 	DESKTOP_WORKSPACE_TOOL_NAMES,
 	DESKTOP_WORKSPACE_TOOLS,
 )
+
+
+def dp_allow_remote():
+	"""An agent policy that allows remote desktop control (as the run pin carries it)."""
+	return {**default_policy(), "allow_remote_desktop": True}
+
 
 ALL_CAPS = ["fs.read", "fs.write", "fs.trash", "exec", "skills.read", "skills.exec"]
 READ_CAPS = ["fs.read", "skills.read"]
@@ -282,7 +289,7 @@ class TestCatalogEndpoint(LocalSkillsBase):
 	def test_run_start_pins_the_hash_and_a_later_catalog_does_not_move_it(self):
 		a = self.publish(catalog(skill("alpha")))["catalog_hash"]
 		frappe.set_user(self.user)
-		ctx, status = ai._resolve_desktop_request(self.exec_id)
+		ctx, status = ai._resolve_desktop_request(self.exec_id, h.secret_of(self.exec_id))
 		self.assertTrue(status["available"])
 		pin = ai._desktop_runtime_context(ctx)
 		self.assertEqual(pin["catalog_hash"], a)
@@ -336,13 +343,14 @@ class TestSkillDispatch(LocalSkillsBase):
 		frappe.set_user(self.user)
 		self.call_id = f"call-ls-{frappe.generate_hash(length=10)}"
 
-	def pin(self, catalog_hash="__default__", origin=None):
+	def pin(self, catalog_hash="__default__", origin=None, **extra):
 		p = h.desktop_pin(self.exec_id, self.user)
 		digest = getattr(self, "cat", None) if catalog_hash == "__default__" else catalog_hash
 		if digest:
 			p["desktop"]["catalog_hash"] = digest
 		if origin:
 			p["desktop"]["origin"] = origin
+		p["desktop"].update(extra)
 		return p
 
 	def kwargs(self, **over):
@@ -506,12 +514,16 @@ class TestSkillDispatch(LocalSkillsBase):
 		self.finish(thread, errors)
 		self.assertNotIn("catalog_hash", seen[0])
 
-	def test_origin_is_carried_from_the_server_side_pin_and_defaults_to_desktop(self):
-		remote = h.make_run(self.user, self.pin(origin="remote"))
-		junk = h.make_run(self.user, self.pin(origin="admin"))
-		self._docs.extend([("Agent Run", remote), ("Agent Run", junk)])
+	def test_origin_is_carried_from_the_server_side_pin_and_unknown_values_fail_closed(self):
+		# remote origin needs the desktop's remote-control switch and the agent's flag (in the pin)
+		h.heartbeat_desktop_executor(executor_id=self.exec_id, workspace=h.workspace(), remote_control=True)
+		allow = dict(dp_allow_remote())
+		local = h.make_run(self.user, self.pin(origin="desktop"))
+		remote = h.make_run(self.user, self.pin(origin="remote", agent_policy=allow))
+		junk = h.make_run(self.user, self.pin(origin="admin", agent_policy=allow))
+		self._docs.extend([("Agent Run", local), ("Agent Run", remote), ("Agent Run", junk)])
 		frappe.set_user(self.user)
-		for run, expected in ((remote, "remote"), (junk, "desktop")):
+		for run, expected in ((local, "desktop"), (remote, "remote"), (junk, "remote")):
 			thread, errors, seen = self.play([(0.1, "result", {"ok": True, "data": {"skills": []}})], run_name=run)
 			out = dl.handle_skill_list(**self.kwargs(agent_run_id=run, call_id=f"c-{run}"))
 			self.finish(thread, errors)

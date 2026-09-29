@@ -254,7 +254,7 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 		ctx = self._validate()
 		self.assertEqual(
 			ctx,
-			{"executor_id": self.exec_id, "fingerprint": h.FP, "user": self.owner, "label": "proj"},
+			{"executor_id": self.exec_id, "fingerprint": h.FP, "user": self.owner, "label": "proj", "origin": "desktop"},
 		)
 
 	def test_executor_id_mismatch_rejected(self):

@@ -759,6 +759,8 @@ def find_device_lease(user, device_id):
 
 def device_last_seen(user, device_id):
 	"""Epoch ms the device was last seen (register, heartbeat, unregister), or None."""
+	if not isinstance(device_id, str) or not _DEVICE_ID_RE.match(device_id):
+		return None
 	try:
 		value = _get(_devseen_key(user, device_id))
 	except Exception:

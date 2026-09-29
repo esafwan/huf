@@ -1293,7 +1293,7 @@ def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owne
     except Exception:
         signed = False
     if signed:
-        resolved["origin"] = pinned.get("origin") or "remote"
+        resolved["origin"] = pinned.get("origin") if pinned.get("origin") in ("desktop", "remote") else "remote"
         if pinned.get("agent_policy"):
             resolved["agent_policy"] = pinned["agent_policy"]
         if pinned.get("device_id") and live.get("device_id") != pinned["device_id"]:
