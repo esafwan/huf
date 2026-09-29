@@ -840,7 +840,8 @@ class TestExposure(sup.ExposureBase):
 		agent = self.agent(list(DESKTOP_WORKSPACE_TOOL_NAMES) + [GRANT, FIND, CALL, BROWSER])
 		names = set(self.build(agent, self.ctx()))
 		self.assertLessEqual(DESKTOP_WORKSPACE_TOOL_NAMES, names)
-		self.assertFalse(names - DESKTOP_WORKSPACE_TOOL_NAMES)
+		self.assertFalse(names & DESKTOP_LOCAL_MCP_TOOL_NAMES)
+		self.assertFalse({n for n in names if n.startswith(DESKTOP_DYNAMIC_TOOL_PREFIXES)})
 
 	def test_invoke_tool_refuses_every_mcp_and_browser_row(self):
 		from huf.ai.tool_invocation import invoke_tool
