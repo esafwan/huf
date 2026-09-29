@@ -549,24 +549,27 @@ class TestDispatchBounds(DesktopExecutorTestCase):
 
 	# H1: the final-result cache is scoped to user and run
 	def test_final_cache_is_scoped_to_the_run(self):
-		self._answer("c-shared")
-		first = dx.dispatch(
-			"fs.mkdir", {"path": "d"}, self.ctx(), call_id="c-shared", agent_run_id="AR-A"
-		)
-		self.assertTrue(first["ok"])
-		# same call id from ANOTHER run must neither read A's cached result nor be blocked
-		self._answer("c-shared", data={"n": 2})
+		# What a finished call of run A left behind (see the key-shape test below).
+		first = {"ok": True, "op": "fs.mkdir", "workspace": "my-project", "data": {"n": "run-A"}}
+		self.cache.set_value(dx._final_key(USER, "AR-A", "c-shared"), first)
+		# the same call id from ANOTHER run must neither read A's cached result nor be blocked
+		self._answer("c-shared", data={"n": "run-B"})
 		second = dx.dispatch(
 			"fs.mkdir", {"path": "e"}, self.ctx(), call_id="c-shared", agent_run_id="AR-B"
 		)
-		self.assertEqual(second["data"], {"n": 2})
-		self.assertEqual(len(self.sent_calls()), 2)
-		# ... while the same run still dedupes
+		self.assertEqual(second["data"], {"n": "run-B"})
+		self.assertEqual(len(self.sent_calls()), 1)
+		# ... while run A still dedupes to its own result without touching the desktop
 		again = dx.dispatch(
 			"fs.mkdir", {"path": "d"}, self.ctx(), call_id="c-shared", agent_run_id="AR-A"
 		)
 		self.assertEqual(again, first)
-		self.assertEqual(len(self.sent_calls()), 2)
+		self.assertEqual(len(self.sent_calls()), 1)
+		# and another user's cache entry is invisible too
+		self.cache.set_value(dx._final_key(OTHER, "AR-B", "c-u"), {"ok": True, "data": {"leak": 1}})
+		self._answer("c-u", data={"mine": 1})
+		res = dx.dispatch("fs.mkdir", {"path": "d"}, self.ctx(), call_id="c-u", agent_run_id="AR-B")
+		self.assertEqual(res["data"], {"mine": 1})
 
 	def test_final_cache_key_contains_user_and_run(self):
 		self._answer("c-key")
