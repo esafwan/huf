@@ -10,6 +10,8 @@ Tests cover:
 - Missing-context error handling
 """
 
+from unittest.mock import MagicMock, patch
+
 import frappe
 from frappe.tests import IntegrationTestCase
 
@@ -179,85 +181,72 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 	"""Test executor context validation (S29 - agent_run half)."""
 
 	def setUp(self):
-		"""Set up test data for executor context tests."""
+		"""Set up for executor context tests."""
 		self._original_user = frappe.session.user
 		frappe.set_user("Administrator")
 
-		# Clean up any existing test artifacts first
-		if frappe.db.exists("Agent Run", "test-run-h4t"):
-			frappe.delete_doc("Agent Run", "test-run-h4t", ignore_permissions=True, force=True)
-		if frappe.db.exists("Agent", "test-agent-h4t"):
-			frappe.delete_doc("Agent", "test-agent-h4t", ignore_permissions=True, force=True)
-
-		# Create test Agent
-		agent = frappe.get_doc({
-			"doctype": "Agent",
-			"name": "test-agent-h4t",
-			"agent_name": "test-agent-h4t",
-			"instructions": "Test agent for H4t tests",
-		})
-		agent.insert(ignore_permissions=True)
-		frappe.db.commit()
-
-		# Create a valid Agent Run with desktop context
-		self.run = frappe.get_doc({
-			"doctype": "Agent Run",
-			"name": "test-run-h4t",
-			"agent": "test-agent-h4t",
-			"status": "Started",
-			"owner": "Administrator",
-			"runtime_context": {
-				"desktop": {
-					"executor_id": "test-executor-id",
-					"fingerprint": "test-fingerprint",
-					"user": "Administrator",
-					"label": "my-project",
-				}
-			},
-		})
-		self.run.insert(ignore_permissions=True)
-		frappe.db.commit()
-
 	def tearDown(self):
-		"""Clean up test data."""
-		frappe.set_user("Administrator")
-		if frappe.db.exists("Agent Run", "test-run-h4t"):
-			frappe.delete_doc("Agent Run", "test-run-h4t", ignore_permissions=True, force=True)
-		if frappe.db.exists("Agent", "test-agent-h4t"):
-			frappe.delete_doc("Agent", "test-agent-h4t", ignore_permissions=True, force=True)
+		"""Restore user after executor context tests."""
 		frappe.set_user(self._original_user)
 
 	def test_executor_context_valid(self):
 		"""S29: Valid executor context should pass validation."""
-		ctx = desktop_workspace._validate_executor_context(
-			_dx_executor_id="test-executor-id",
-			_dx_fingerprint="test-fingerprint",
-			_dx_user="Administrator",
-			agent_run_id="test-run-h4t",
-		)
-		self.assertIsNotNone(ctx)
-		self.assertEqual(ctx["executor_id"], "test-executor-id")
+		mock_run = MagicMock()
+		mock_run.owner = "Administrator"
+		mock_run.runtime_context = {
+			"desktop": {
+				"executor_id": "test-executor-id",
+				"fingerprint": "test-fingerprint",
+				"user": "Administrator",
+				"label": "my-project",
+			}
+		}
 
-	def test_executor_id_mismatch_rejected(self):
-		"""S29: LLM-supplied executor_id that doesn't match should be rejected."""
-		with self.assertRaises(frappe.ValidationError) as ctx:
-			desktop_workspace._validate_executor_context(
-				_dx_executor_id="wrong-executor-id",
-				_dx_fingerprint="test-fingerprint",
-				_dx_user="Administrator",
-				agent_run_id="test-run-h4t",
-			)
-		self.assertIn("mismatch", str(ctx.exception).lower())
-
-	def test_foreign_agent_run_rejected(self):
-		"""S29: Foreign agent_run_id should be rejected. Missing-context error."""
-		with self.assertRaises(frappe.DoesNotExistError):
-			desktop_workspace._validate_executor_context(
+		with patch("huf.ai.tools.desktop_workspace.frappe.get_doc", return_value=mock_run):
+			ctx = desktop_workspace._validate_executor_context(
 				_dx_executor_id="test-executor-id",
 				_dx_fingerprint="test-fingerprint",
 				_dx_user="Administrator",
-				agent_run_id="nonexistent-run",
+				agent_run_id="test-run",
 			)
+			self.assertIsNotNone(ctx)
+			self.assertEqual(ctx["executor_id"], "test-executor-id")
+
+	def test_executor_id_mismatch_rejected(self):
+		"""S29: LLM-supplied executor_id that doesn't match should be rejected."""
+		mock_run = MagicMock()
+		mock_run.owner = "Administrator"
+		mock_run.runtime_context = {
+			"desktop": {
+				"executor_id": "test-executor-id",
+				"fingerprint": "test-fingerprint",
+				"user": "Administrator",
+				"label": "my-project",
+			}
+		}
+
+		with patch("huf.ai.tools.desktop_workspace.frappe.get_doc", return_value=mock_run):
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				desktop_workspace._validate_executor_context(
+					_dx_executor_id="wrong-executor-id",
+					_dx_fingerprint="test-fingerprint",
+					_dx_user="Administrator",
+					agent_run_id="test-run",
+				)
+			self.assertIn("mismatch", str(ctx.exception).lower())
+
+	def test_foreign_agent_run_rejected(self):
+		"""S29: Foreign agent_run_id should be rejected. Missing-context error."""
+		with patch("huf.ai.tools.desktop_workspace.frappe.get_doc") as mock_get_doc:
+			mock_get_doc.side_effect = frappe.DoesNotExistError
+
+			with self.assertRaises(frappe.DoesNotExistError):
+				desktop_workspace._validate_executor_context(
+					_dx_executor_id="test-executor-id",
+					_dx_fingerprint="test-fingerprint",
+					_dx_user="Administrator",
+					agent_run_id="nonexistent-run",
+				)
 
 	def test_user_mismatch_rejected(self):
 		"""S29: Session user must match the pinned user."""
@@ -268,7 +257,7 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 				_dx_executor_id="test-executor-id",
 				_dx_fingerprint="test-fingerprint",
 				_dx_user="Administrator",
-				agent_run_id="test-run-h4t",
+				agent_run_id="test-run",
 			)
 
 	def test_guest_rejected(self):
@@ -280,5 +269,5 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 				_dx_executor_id="test-executor-id",
 				_dx_fingerprint="test-fingerprint",
 				_dx_user="Guest",
-				agent_run_id="test-run-h4t",
+				agent_run_id="test-run",
 			)
