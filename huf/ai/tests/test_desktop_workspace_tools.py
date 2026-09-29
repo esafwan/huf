@@ -194,7 +194,7 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 			"doctype": "Agent Run",
 			"name": "test-run",
 			"agent": "test-agent",
-			"status": "Completed",
+			"status": "Success",
 			"owner": "Administrator",
 			"runtime_context": {
 				"desktop": {
