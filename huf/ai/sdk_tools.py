@@ -165,10 +165,15 @@ def _is_desktop_workspace_tool_doc(function_doc) -> bool:
 def _desktop_tool_group(function_doc):
     """Which desktop tool group an Agent Tool Function row belongs to, or None.
 
-    ``"workspace"`` and ``"skills"`` are built; ``"unknown"`` is a row whose handler lives in a
-    ``desktop_*`` module this server does not know how to expose (never built: fail closed).
+    ``"workspace"``, ``"skills"``, ``"processes"`` and ``"mcp"`` (local MCP and browser grants)
+    are built; ``"unknown"`` is a row whose handler lives in a ``desktop_*`` module this server
+    does not know how to expose (never built: fail closed).
     """
-    from huf.ai.tools._registry import DESKTOP_LOCAL_SKILL_TOOL_NAMES
+    from huf.ai.tools._registry import (
+        DESKTOP_LOCAL_MCP_TOOL_NAMES,
+        DESKTOP_LOCAL_SKILL_TOOL_NAMES,
+        DESKTOP_PROCESS_TOOL_NAMES,
+    )
 
     name = function_doc.tool_name or ""
     path = function_doc.function_path or ""
@@ -176,6 +181,10 @@ def _desktop_tool_group(function_doc):
         return "workspace"
     if name in DESKTOP_LOCAL_SKILL_TOOL_NAMES:
         return "skills"
+    if name in DESKTOP_PROCESS_TOOL_NAMES:
+        return "processes"
+    if name in DESKTOP_LOCAL_MCP_TOOL_NAMES:
+        return "mcp"
     if path.startswith("huf.ai.tools.desktop_"):
         return "unknown"
     return None
@@ -272,16 +281,29 @@ def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
     }
 
     skills_state = None  # (capabilities, visible skills, hidden ids), computed on first use
+    lease_caps = None
     built = []
     seen = set()
+    mcp_docs = []
     for function_doc in function_docs:
         if function_doc.tool_name in seen:
             continue
         group = _desktop_tool_group(function_doc)
-        if group not in ("workspace", "skills"):
+        if group == "mcp":
+            mcp_docs.append(function_doc)
+            continue
+        if group not in ("workspace", "skills", "processes"):
             continue
         description = function_doc.description
         tool_extra = dict(extra_args)
+        if group == "processes":
+            from huf.ai.desktop_executor import lease_capabilities
+            from huf.ai.tools._registry import DESKTOP_PROCESS_CAPABILITY
+
+            if lease_caps is None:
+                lease_caps = lease_capabilities(executor_id)
+            if DESKTOP_PROCESS_CAPABILITY not in lease_caps:
+                continue
         if group == "skills":
             if skills_state is None:
                 skills_state = _local_skills_state(desktop_ctx, executor_id, agent)
@@ -316,6 +338,119 @@ def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
                 seen.add(function_doc.tool_name)
         except Exception as e:
             frappe.logger("huf").debug(f"Error wiring desktop tool {function_doc.tool_name}: {e!s}")
+    if mcp_docs:
+        built.extend(_build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args, seen))
+    return built
+
+
+_MCP_TOOL_HANDLER = "huf.ai.tools.desktop_local.handle_mcp_tool_call"
+
+
+def _spec_parameters_schema(spec) -> dict:
+    """JSON schema for a registry spec's ``parameters`` list (used for the find/call tools that a
+    grant expands to, which are not necessarily attached as rows)."""
+    props, required = {}, []
+    for p in spec.get("parameters") or []:
+        prop = {"type": p["type"], "description": p.get("description", "")}
+        if p["type"] == "array":
+            prop["items"] = {"type": "string"}
+        props[p["fieldname"]] = prop
+        if p.get("required"):
+            required.append(p["fieldname"])
+    schema = {"type": "object", "properties": props}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args, seen) -> list:
+    """The local MCP and browser groups (PLAN 4.3, 4.4, 4.8).
+
+    ``desktop_local_mcp`` expands to ``lmcp__<server>__<tool>`` tools within the eager budget and,
+    when tools remain, to ``desktop_mcp_find`` + ``desktop_mcp_call``; those two are also built
+    when their own rows are attached. ``desktop_browser`` expands to the curated browser subset.
+    Everything is built from the catalog PINNED to the run and needs the lease capabilities in
+    ``DESKTOP_LOCAL_MCP_CAPABILITY``. The agent name, server and tool of every tool are pinned
+    here (``_dx_*`` overwrite whatever the model sends).
+    """
+    from huf.ai import desktop_mcp
+    from huf.ai.desktop_executor import get_catalog, lease_capabilities, sanitize_text
+    from huf.ai.tools._registry import DESKTOP_LOCAL_MCP_CAPABILITY, DESKTOP_LOCAL_MCP_TOOLS
+
+    catalog = get_catalog(executor_id, desktop_ctx.get("catalog_hash"))
+    if not catalog:
+        return []
+    caps = set(lease_capabilities(executor_id))
+    attached = {d.tool_name: d for d in mcp_docs}
+    agent_name = (getattr(agent, "name", None) or getattr(agent, "agent_name", None)) if agent is not None else None
+    base_extra = {**extra_args, "_dx_agent": agent_name or ""}
+    specs = {t["tool_name"]: t for t in DESKTOP_LOCAL_MCP_TOOLS}
+    built = []
+
+    def allowed(name):
+        return set(DESKTOP_LOCAL_MCP_CAPABILITY[name]) <= caps
+
+    def add(tool):
+        if tool and tool.name not in seen:
+            built.append(tool)
+            seen.add(tool.name)
+
+    def dynamic(spec, kind):
+        try:
+            return create_function_tool(
+                spec["name"],
+                spec["description"],
+                _MCP_TOOL_HANDLER,
+                spec["schema"],
+                extra_args={
+                    **base_extra,
+                    "_dx_mcp_server": spec["server"],
+                    "_dx_mcp_tool": spec["tool"],
+                    "_dx_mcp_kind": kind,
+                },
+                blocking=True,
+                pin_run_context=True,
+            )
+        except Exception as e:
+            frappe.logger("huf").debug(f"Error wiring local MCP tool {spec.get('name')}: {e!s}")
+            return None
+
+    def fixed(name):
+        spec = specs[name]
+        try:
+            return create_function_tool(
+                name,
+                spec["description"],
+                spec["function_path"],
+                _spec_parameters_schema(spec),
+                extra_args=base_extra,
+                blocking=True,
+                pin_run_context=True,
+            )
+        except Exception as e:
+            frappe.logger("huf").debug(f"Error wiring desktop tool {name}: {e!s}")
+            return None
+
+    plan = None
+    if ("desktop_local_mcp" in attached and allowed("desktop_local_mcp")) or any(
+        n in attached and allowed(n) for n in ("desktop_mcp_find", "desktop_mcp_call")
+    ):
+        plan = desktop_mcp.plan_mcp_group(catalog, agent_name, sanitize_text)
+    if plan is not None:
+        grant = "desktop_local_mcp" in attached and allowed("desktop_local_mcp")
+        if grant:
+            for spec in plan["eager"]:
+                add(dynamic(spec, "mcp"))
+        has_tools = bool(plan["eager"] or plan["overflow"])
+        for name in ("desktop_mcp_find", "desktop_mcp_call"):
+            if not has_tools:
+                continue
+            if (grant and plan["overflow"]) or (name in attached and allowed(name)):
+                add(fixed(name))
+
+    if "desktop_browser" in attached and allowed("desktop_browser"):
+        for spec in desktop_mcp.plan_browser_group(catalog, agent_name, sanitize_text):
+            add(dynamic(spec, "browser"))
     return built
 
 
@@ -526,10 +661,11 @@ def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None =
         skill_tools = load_all_skill_tools(agent, frappe.session.user)
         if skill_tools:
             # Skill-attached tools must not bypass the desktop ctx gate.
-            from huf.ai.tools._registry import DESKTOP_TOOL_NAMES
+            from huf.ai.tools._registry import DESKTOP_DYNAMIC_TOOL_PREFIXES, DESKTOP_TOOL_NAMES
             tools.extend(
                 t for t in skill_tools
                 if getattr(t, "name", "") not in DESKTOP_TOOL_NAMES
+                and not str(getattr(t, "name", "")).startswith(DESKTOP_DYNAMIC_TOOL_PREFIXES)
             )
     except Exception as e:
         frappe.log_error(
