@@ -250,7 +250,7 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 
 	def test_user_mismatch_rejected(self):
 		"""S29: Session user must match the pinned user."""
-		frappe.set_user("Guest")
+		frappe.set_user("testuser")
 
 		with self.assertRaises(frappe.PermissionError):
 			desktop_workspace._validate_executor_context(
