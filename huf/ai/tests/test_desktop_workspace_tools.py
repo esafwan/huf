@@ -193,16 +193,16 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 		"""S29: Valid executor context should pass validation."""
 		mock_run = MagicMock()
 		mock_run.owner = "Administrator"
-		mock_run.runtime_context = {
+		mock_run.get = MagicMock(return_value={
 			"desktop": {
 				"executor_id": "test-executor-id",
 				"fingerprint": "test-fingerprint",
 				"user": "Administrator",
 				"label": "my-project",
 			}
-		}
+		})
 
-		with patch("huf.ai.tools.desktop_workspace.frappe.get_doc", return_value=mock_run):
+		with patch.object(frappe, "get_doc", return_value=mock_run):
 			ctx = desktop_workspace._validate_executor_context(
 				_dx_executor_id="test-executor-id",
 				_dx_fingerprint="test-fingerprint",
@@ -216,16 +216,16 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 		"""S29: LLM-supplied executor_id that doesn't match should be rejected."""
 		mock_run = MagicMock()
 		mock_run.owner = "Administrator"
-		mock_run.runtime_context = {
+		mock_run.get = MagicMock(return_value={
 			"desktop": {
 				"executor_id": "test-executor-id",
 				"fingerprint": "test-fingerprint",
 				"user": "Administrator",
 				"label": "my-project",
 			}
-		}
+		})
 
-		with patch("huf.ai.tools.desktop_workspace.frappe.get_doc", return_value=mock_run):
+		with patch.object(frappe, "get_doc", return_value=mock_run):
 			with self.assertRaises(frappe.ValidationError) as ctx:
 				desktop_workspace._validate_executor_context(
 					_dx_executor_id="wrong-executor-id",
@@ -237,7 +237,7 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 
 	def test_foreign_agent_run_rejected(self):
 		"""S29: Foreign agent_run_id should be rejected. Missing-context error."""
-		with patch("huf.ai.tools.desktop_workspace.frappe.get_doc") as mock_get_doc:
+		with patch.object(frappe, "get_doc") as mock_get_doc:
 			mock_get_doc.side_effect = frappe.DoesNotExistError
 
 			with self.assertRaises(frappe.DoesNotExistError):
