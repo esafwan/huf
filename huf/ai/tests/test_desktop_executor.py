@@ -55,6 +55,7 @@ class FakeCache:
 		self.on_blpop = None
 		self.deleted_raw = []
 		self.counters = {}
+		self.hashes = {}
 		self.now = 1000.0
 
 	# frappe surface
@@ -85,6 +86,8 @@ class FakeCache:
 		k = self._l(key)
 		if k in self.counters:
 			return str(self.counters[k]).encode()
+		if k in self.flags:
+			return str(self.flags[k]).encode()
 		return pickle.dumps(self.values[k]) if k in self.values else None
 
 	def incr(self, key):
@@ -127,6 +130,8 @@ class FakeCache:
 			self.deleted_raw.append(k)
 			self.values.pop(k, None)
 			self.raw.pop(k, None)
+			self.hashes.pop(k, None)
+			self.flags.pop(k, None)
 
 	def rpush(self, key, val):
 		self.raw.setdefault(self._l(key), []).append(val)
@@ -151,6 +156,22 @@ class FakeCache:
 
 	def zrem(self, key, member):
 		self.zsets.get(self._l(key), {}).pop(member, None)
+
+	def zcard(self, key):
+		return len(self.zsets.get(self._l(key), {}))
+
+	def hset(self, key, field, value):
+		self.hashes.setdefault(self._l(key), {})[field] = value
+
+	def hget(self, key, field):
+		val = self.hashes.get(self._l(key), {}).get(field)
+		return val.encode() if isinstance(val, str) else val
+
+	def hgetall(self, key):
+		return {f.encode(): v.encode() for f, v in self.hashes.get(self._l(key), {}).items()}
+
+	def hdel(self, key, field):
+		self.hashes.get(self._l(key), {}).pop(field, None)
 
 	def zremrangebyscore(self, key, lo, hi):
 		z = self.zsets.get(self._l(key), {})
@@ -586,38 +607,68 @@ class TestDispatchBounds(DesktopExecutorTestCase):
 		self.assertEqual(res["error"]["code"], "duplicate_in_flight")
 		self.publish.assert_not_called()
 
-	# H2: concurrency caps
+	# H2 / N6: concurrency caps. Slots are lease-scored holders, not a counter.
+	FAR_FUTURE_MS = 9**12
+
+	def _fill_slots(self, key, n, expiry=None):
+		self.cache.seed_zadd(key, {f"holder-{i}": expiry or self.FAR_FUTURE_MS for i in range(n)})
+
 	def test_per_executor_cap_returns_busy_immediately(self):
-		self.cache.counters[dx._inflight_executor_key(EXEC_ID)] = dx.MAX_INFLIGHT_PER_EXECUTOR
+		key = dx._inflight_executor_key(EXEC_ID)
+		self._fill_slots(key, dx.MAX_INFLIGHT_PER_EXECUTOR)
 		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-busy")
 		self.assertEqual(res["error"]["code"], "busy")
 		self.publish.assert_not_called()
 		self.assertEqual(self.cache.blpop_timeouts, [])
 		# the failed attempt did not leak a slot
-		self.assertEqual(self.cache.counters[dx._inflight_executor_key(EXEC_ID)], dx.MAX_INFLIGHT_PER_EXECUTOR)
-		self.assertEqual(self.cache.counters.get(dx._inflight_user_key(USER), 0), 0)
+		self.assertEqual(len(self.cache.zsets[key]), dx.MAX_INFLIGHT_PER_EXECUTOR)
+		self.assertEqual(len(self.cache.zsets.get(dx._inflight_user_key(USER), {})), 0)
 
 	def test_per_user_cap_returns_busy_and_releases_the_executor_slot(self):
-		self.cache.counters[dx._inflight_user_key(USER)] = dx.MAX_INFLIGHT_PER_USER
+		self._fill_slots(dx._inflight_user_key(USER), dx.MAX_INFLIGHT_PER_USER)
 		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-busy-u")
 		self.assertEqual(res["error"]["code"], "busy")
 		self.publish.assert_not_called()
-		self.assertEqual(self.cache.counters[dx._inflight_executor_key(EXEC_ID)], 0)
+		self.assertEqual(len(self.cache.zsets[dx._inflight_executor_key(EXEC_ID)]), 0)
 
 	def test_slots_are_released_after_success_and_after_timeout(self):
 		self._answer("c-slot")
 		dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-slot")
-		self.assertEqual(self.cache.counters[dx._inflight_executor_key(EXEC_ID)], 0)
-		self.assertEqual(self.cache.counters[dx._inflight_user_key(USER)], 0)
+		self.assertEqual(len(self.cache.zsets[dx._inflight_executor_key(EXEC_ID)]), 0)
+		self.assertEqual(len(self.cache.zsets[dx._inflight_user_key(USER)]), 0)
 		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-slot-2")  # no ack
 		self.assertEqual(res["error"]["code"], "desktop_unreachable")
-		self.assertEqual(self.cache.counters[dx._inflight_executor_key(EXEC_ID)], 0)
+		self.assertEqual(len(self.cache.zsets[dx._inflight_executor_key(EXEC_ID)]), 0)
 
 	def test_calls_below_the_cap_are_admitted(self):
-		self.cache.counters[dx._inflight_executor_key(EXEC_ID)] = dx.MAX_INFLIGHT_PER_EXECUTOR - 1
+		self._fill_slots(dx._inflight_executor_key(EXEC_ID), dx.MAX_INFLIGHT_PER_EXECUTOR - 1)
 		self._answer("c-ok-cap")
 		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-ok-cap")
 		self.assertTrue(res["ok"])
+
+	def test_slots_of_a_dead_worker_are_reaped_by_lease_expiry(self):
+		# A worker that died mid-wait never released its 4 holders; their leases have lapsed.
+		key = dx._inflight_executor_key(EXEC_ID)
+		self._fill_slots(key, dx.MAX_INFLIGHT_PER_EXECUTOR, expiry=dx._now_ms() - 1)
+		self._answer("c-reap")
+		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-reap")
+		self.assertTrue(res["ok"], res)
+		self.assertEqual(len(self.cache.zsets[key]), 0)  # dead holders pruned, ours released
+
+	def test_slots_of_a_live_worker_are_not_reaped(self):
+		key = dx._inflight_executor_key(EXEC_ID)
+		self._fill_slots(key, dx.MAX_INFLIGHT_PER_EXECUTOR, expiry=dx._now_ms() + 5_000)
+		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-live")
+		self.assertEqual(res["error"]["code"], "busy")
+
+	def test_the_waiter_refreshes_its_slot_lease_while_it_waits(self):
+		key = dx._inflight_executor_key(EXEC_ID)
+		with mock.patch.object(dx, "_slots_heartbeat", wraps=dx._slots_heartbeat) as beat:
+			dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-hb")  # 10 s ack wait, no ack
+		self.assertGreaterEqual(beat.call_count, dx.ACK_TIMEOUT_S // dx.POLL_SLICE_S)
+		# the lease it wrote is short (a dead worker is reaped within SLOT_LEASE_S)
+		self.assertLessEqual(dx.SLOT_LEASE_S, 30)
+		self.assertEqual(len(self.cache.zsets[key]), 0)
 
 	# H2: total wait stays under the queue job timeout
 	def test_run_budget_is_below_the_queue_job_timeout(self):
@@ -765,6 +816,348 @@ class TestDispatchBounds(DesktopExecutorTestCase):
 			res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-down")
 		self.assertIn(res["error"]["code"], ("desktop_offline", "cache_unavailable"))
 		dx.frappe.log_error.assert_not_called()
+
+
+class TestWebBudget(DesktopExecutorTestCase):
+	"""N5: inside a web request the total desktop wait stays below the gunicorn timeout."""
+
+	def setUp(self):
+		super().setUp()
+		self.register()
+
+	def _answer(self, call_id, result=True):
+		def desktop():
+			self.desktop_submit(call_id, "ack")
+			if result:
+				self.desktop_submit(call_id, "result", {"ok": True, "data": {"n": 1}})
+
+		self.cache.on_blpop = desktop
+
+	def test_default_web_budget_is_below_gunicorns_default_timeout(self):
+		self.assertEqual(dx.WEB_WAIT_BUDGET_S, 90)
+		self.assertLess(dx.web_wait_budget_s(), 120)
+		self.assertLess(dx.web_wait_budget_s(), dx.run_wait_budget_s())
+
+	def test_web_budget_is_overridable_in_site_config(self):
+		with mock.patch.dict(frappe.conf, {"huf_desktop_web_budget_s": 45}):
+			self.assertEqual(dx.web_wait_budget_s(), 45)
+
+	def test_web_request_is_detected_from_frappe_local_request(self):
+		self.assertFalse(dx._in_web_request())
+		with mock.patch.object(dx.frappe.local, "request", object(), create=True):
+			self.assertTrue(dx._in_web_request())
+
+	def test_exhausted_web_budget_ends_the_call_without_publishing(self):
+		self.cache.counters[dx._budget_key("AR-W1")] = dx.web_wait_budget_s() * 1000
+		res = dx.dispatch(
+			"fs.read", {"path": "a"}, self.ctx(), call_id="c-w1", agent_run_id="AR-W1", web_request=True
+		)
+		self.assertEqual(res["error"]["code"], "web_budget_exhausted")
+		self.assertIn("Nothing was sent", res["error"]["message"])
+		self.publish.assert_not_called()
+
+	def test_the_same_usage_is_fine_outside_a_web_request(self):
+		self.cache.counters[dx._budget_key("AR-W2")] = dx.web_wait_budget_s() * 1000
+		self._answer("c-w2")
+		res = dx.dispatch(
+			"fs.read", {"path": "a"}, self.ctx(), call_id="c-w2", agent_run_id="AR-W2", web_request=False
+		)
+		self.assertTrue(res["ok"], res)
+
+	def test_web_budget_caps_the_call_deadline(self):
+		self._answer("c-w3")
+		dx.dispatch(
+			"fs.read",
+			{"path": "a"},
+			self.ctx(),
+			call_id="c-w3",
+			agent_run_id="AR-W3",
+			timeout_ms=200_000,
+			web_request=True,
+		)
+		m = self.sent_calls()[0]["message"]
+		self.assertLessEqual(m["deadline_at"] - m["issued_at"], dx.web_wait_budget_s() * 1000)
+
+	def test_a_call_running_past_the_web_budget_is_cancelled_and_reported(self):
+		remaining_s = 30
+		self.cache.counters[dx._budget_key("AR-W4")] = (dx.web_wait_budget_s() - remaining_s) * 1000
+		self._answer("c-w4", result=False)  # acked, never finishes
+		res = dx.dispatch(
+			"fs.read",
+			{"path": "a"},
+			self.ctx(),
+			call_id="c-w4",
+			agent_run_id="AR-W4",
+			timeout_ms=200_000,
+			web_request=True,
+		)
+		self.assertEqual(res["error"]["code"], "web_budget_exhausted")
+		self.assertIn("cancelled", res["error"]["message"])
+		self.assertEqual([c["message"]["call_id"] for c in self.cancels()], ["c-w4"])
+		self.assertEqual(self.cancels()[0]["message"]["reason"], "server_timeout")
+		self.assertLessEqual(self.cache.now - 1000.0, remaining_s + dx.POLL_SLICE_S + 1)
+
+	def test_web_calls_of_a_run_never_wait_more_than_the_web_budget_in_total(self):
+		waited = 0.0
+		for i in range(50):
+			before = self.cache.now
+			res = dx.dispatch(
+				"fs.read",
+				{"path": "a"},
+				self.ctx(),
+				call_id=f"c-wl-{i}",
+				agent_run_id="AR-W5",
+				web_request=True,
+			)  # never acked: 10 s ack window each
+			waited += self.cache.now - before
+			if res["error"]["code"] == "web_budget_exhausted":
+				break
+		else:
+			self.fail("web budget never exhausted")
+		self.assertLessEqual(waited, dx.web_wait_budget_s() + 1)
+
+	def test_handler_reports_a_web_request_to_dispatch(self):
+		from huf.ai.tools import desktop_workspace as dw
+
+		self.assertFalse(dw._in_web_request())
+		with mock.patch.object(dw.frappe.local, "request", object(), create=True):
+			self.assertTrue(dw._in_web_request())
+
+
+class TestBudgetAccounting(DesktopExecutorTestCase):
+	"""N6: wall-clock charging, shared job budget."""
+
+	def setUp(self):
+		super().setUp()
+		self.register()
+
+	def test_parallel_calls_are_charged_wall_clock_once(self):
+		def inner():
+			# a second call of the same run starts while the first is in flight (parallel tool calls)
+			res = dx.dispatch("fs.read", {"path": "b"}, self.ctx(), call_id="c-p2", agent_run_id="AR-P")
+			self.assertEqual(res["error"]["code"], "desktop_unreachable")
+
+		self.cache.on_blpop = inner
+		start = self.cache.now
+		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-p1", agent_run_id="AR-P")
+		self.assertEqual(res["error"]["code"], "desktop_unreachable")
+		wall = self.cache.now - start
+		charged = self.cache.counters[dx._budget_key("AR-P")] / 1000.0
+		self.assertAlmostEqual(charged, wall, delta=0.5)
+		# each call individually waited ~10 s; charging per call would have booked ~20 s
+		self.assertLess(charged, 16)
+
+	def test_window_state_is_process_local_and_empties_after_the_last_call(self):
+		dx._window_open("scope-x")
+		dx._window_open("scope-x")
+		self.cache.now += 5
+		self.assertAlmostEqual(dx._window_open_elapsed_s("scope-x"), 5, delta=0.01)
+		self.assertEqual(dx._window_close("scope-x"), 0.0)  # one call still in flight
+		self.cache.now += 3
+		self.assertAlmostEqual(dx._window_close("scope-x"), 8, delta=0.01)
+		self.assertEqual(dx._window_open_elapsed_s("scope-x"), 0.0)
+		self.assertEqual(dx._window_close("scope-x"), 0.0)  # idempotent / no window
+
+	def test_runs_drained_under_one_job_share_one_budget(self):
+		job = dx.begin_job_budget("CONV-1")
+		self.assertTrue(job)
+		for run in ("AR-J1", "AR-J2"):
+			dx.dispatch(
+				"fs.read", {"path": "a"}, self.ctx(), call_id=f"c-{run}", agent_run_id=run, conversation_id="CONV-1"
+			)  # each: 10 s ack wait
+		used = self.cache.counters[dx._budget_key(f"job:{job}")] / 1000.0
+		self.assertAlmostEqual(used, 20, delta=2)
+
+	def test_exhausted_job_budget_ends_calls_of_every_run_of_the_job(self):
+		job = dx.begin_job_budget("CONV-2")
+		self.cache.counters[dx._budget_key(f"job:{job}")] = int(dx.run_wait_budget_s() * 1000)
+		res = dx.dispatch(
+			"fs.read", {"path": "a"}, self.ctx(), call_id="c-j3", agent_run_id="AR-J3", conversation_id="CONV-2"
+		)
+		self.assertEqual(res["error"]["code"], "budget_exhausted")
+		self.publish.assert_not_called()  # a fresh run, with an untouched run budget, is still refused
+		dx.end_job_budget("CONV-2")
+		res = dx.dispatch(
+			"fs.read", {"path": "a"}, self.ctx(), call_id="c-j4", agent_run_id="AR-J4", conversation_id="CONV-2"
+		)
+		self.assertEqual(res["error"]["code"], "desktop_unreachable")  # job over: no shared budget
+
+	def test_job_budget_shortens_the_call_deadline(self):
+		job = dx.begin_job_budget("CONV-3")
+		self.cache.counters[dx._budget_key(f"job:{job}")] = int((dx.run_wait_budget_s() - 20) * 1000)
+		dx.dispatch(
+			"fs.read",
+			{"path": "a"},
+			self.ctx(),
+			call_id="c-j5",
+			agent_run_id="AR-J5",
+			conversation_id="CONV-3",
+			timeout_ms=200_000,
+		)
+		m = self.sent_calls()[0]["message"]
+		self.assertLessEqual(m["deadline_at"] - m["issued_at"], 20_000)
+
+
+class TestCallIdentityAndReruns(DesktopExecutorTestCase):
+	"""N7 (reused provider tool_call ids) and N5 (a re-run must not repeat mutations)."""
+
+	def setUp(self):
+		super().setUp()
+		self.register()
+
+	def _answer(self, call_id, data):
+		def desktop():
+			self.desktop_submit(call_id, "ack")
+			self.desktop_submit(call_id, "result", {"ok": True, "data": data})
+
+		self.cache.on_blpop = desktop
+
+	def test_a_reused_call_id_with_different_params_is_a_new_call_with_its_own_result(self):
+		self._answer("0", {"made": "d"})
+		first = dx.dispatch("fs.mkdir", {"path": "d"}, self.ctx(), call_id="0", agent_run_id="AR-N7")
+		self.assertEqual(first["data"], {"made": "d"})
+		sent = self.sent_calls()[0]["message"]
+		self.assertEqual(sent["call_id"], "0")
+		# the provider reuses "0" on the next turn with other params
+		fresh_id = dx._fresh_call_id("0", dx._call_sig("fs.mkdir", {"path": "e"}))
+		self._answer(fresh_id, {"made": "e"})
+		second = dx.dispatch("fs.mkdir", {"path": "e"}, self.ctx(), call_id="0", agent_run_id="AR-N7")
+		self.assertEqual(second["data"], {"made": "e"})  # not turn 1's stale {"made": "d"}
+		self.assertEqual(len(self.sent_calls()), 2)
+		self.assertEqual(self.sent_calls()[1]["message"]["call_id"], fresh_id)
+		self.assertEqual(self.sent_calls()[1]["message"]["params"], {"path": "e"})
+
+	def test_a_reused_call_id_with_a_different_op_is_a_new_call(self):
+		self._answer("call_1", {"x": 1})
+		dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="call_1", agent_run_id="AR-N7b")
+		fresh_id = dx._fresh_call_id("call_1", dx._call_sig("fs.trash", {"path": "a"}))
+		self._answer(fresh_id, {"trashed": True})
+		res = dx.dispatch("fs.trash", {"path": "a"}, self.ctx(), call_id="call_1", agent_run_id="AR-N7b")
+		self.assertEqual(res["data"], {"trashed": True})
+		self.assertEqual(self.sent_calls()[1]["message"]["op"], "fs.trash")
+
+	def test_the_same_id_with_the_same_params_still_dedupes(self):
+		self._answer("call_2", {"n": 1})
+		first = dx.dispatch("fs.mkdir", {"path": "d", }, self.ctx(), call_id="call_2", agent_run_id="AR-N7c")
+		again = dx.dispatch("fs.mkdir", {"path": "d"}, self.ctx(), call_id="call_2", agent_run_id="AR-N7c")
+		self.assertEqual(again, first)
+		self.assertNotIn("_dx_sig", again)
+		self.assertEqual(len(self.sent_calls()), 1)
+
+	def test_param_key_order_does_not_change_the_signature(self):
+		self.assertEqual(
+			dx._call_sig("fs.edit", {"a": 1, "b": {"c": 2, "d": 3}}),
+			dx._call_sig("fs.edit", {"b": {"d": 3, "c": 2}, "a": 1}),
+		)
+		self.assertNotEqual(dx._call_sig("fs.read", {"path": "a"}), dx._call_sig("fs.trash", {"path": "a"}))
+
+	def test_a_cached_result_for_other_params_is_never_returned(self):
+		# what a previous turn cached under the same id (with the hash of ITS params)
+		self.cache.set_value(
+			dx._final_key(USER, "AR-N7d", "0"),
+			{"ok": True, "data": {"stale": True}, "_dx_sig": dx._call_sig("fs.mkdir", {"path": "old"})},
+		)
+		fresh_id = dx._fresh_call_id("0", dx._call_sig("fs.mkdir", {"path": "new"}))
+		self._answer(fresh_id, {"fresh": True})
+		res = dx.dispatch("fs.mkdir", {"path": "new"}, self.ctx(), call_id="0", agent_run_id="AR-N7d")
+		self.assertEqual(res["data"], {"fresh": True})
+
+	def test_an_in_flight_call_with_other_params_does_not_block_or_hijack(self):
+		stashed = {
+			"call_id": "0",
+			"agent_run_id": "AR-N7e",
+			"op": "fs.read",
+			"params": {"path": "old"},
+			"deadline_at": dx._now_ms() + 60_000,
+		}
+		self.cache.set_value(dx._request_key("0"), {"user": USER, "executor_id": EXEC_ID, "request": stashed})
+		fresh_id = dx._fresh_call_id("0", dx._call_sig("fs.read", {"path": "new"}))
+		self._answer(fresh_id, {"content": "new"})
+		res = dx.dispatch("fs.read", {"path": "new"}, self.ctx(), call_id="0", agent_run_id="AR-N7e")
+		self.assertEqual(res["data"], {"content": "new"})
+
+	def test_the_ledger_catches_a_reused_id_after_the_result_cache_expired(self):
+		self._answer("0", {"n": 1})
+		dx.dispatch("fs.mkdir", {"path": "d"}, self.ctx(), call_id="0", agent_run_id="AR-N7f")
+		self.cache.values.pop(dx._final_key(USER, "AR-N7f", "0"))  # 300 s TTL elapsed
+		fresh_id = dx._fresh_call_id("0", dx._call_sig("fs.mkdir", {"path": "e"}))
+		self._answer(fresh_id, {"n": 2})
+		res = dx.dispatch("fs.mkdir", {"path": "e"}, self.ctx(), call_id="0", agent_run_id="AR-N7f")
+		self.assertEqual(res["data"], {"n": 2})
+		self.assertEqual(len(self.sent_calls()), 2)
+
+	def test_fresh_call_id_stays_within_the_wire_limit(self):
+		self.assertLessEqual(len(dx._fresh_call_id("x" * 200, "a" * 64)), 200)
+		self.assertEqual(dx._fresh_call_id("0", "abcdef0123456789"), "0.abcdef0123")
+
+	# ---- N5: a run that is executed again
+	def _run_mutation(self, run, call_id, params, data):
+		self._answer(call_id, data)
+		return dx.dispatch("fs.write", params, self.ctx(), call_id=call_id, agent_run_id=run)
+
+	def test_the_ledger_records_mutating_calls_and_the_sweeper_helper_sees_them(self):
+		self.assertFalse(dx.run_executed_mutations("AR-L1"))
+		self._answer("c-read", {"content": "x"})
+		dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-read", agent_run_id="AR-L1")
+		self.assertFalse(dx.run_executed_mutations("AR-L1"))  # reads are safe to repeat
+		self._run_mutation("AR-L1", "c-write", {"path": "a", "content": "x"}, {"written": 1})
+		self.assertTrue(dx.run_executed_mutations("AR-L1"))
+		self.assertFalse(dx.run_executed_mutations("AR-other"))
+		self.assertGreater(self.cache.expiries[dx._ledger_key("AR-L1")], 3600)
+
+	def test_a_call_that_reached_the_desktop_is_in_the_ledger_before_it_finishes(self):
+		# the worker dies while waiting: no result was ever recorded, but the call is known
+		seen = []
+		self.cache.on_blpop = lambda: seen.append(dx.run_executed_mutations("AR-L2"))
+		dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="c-w", agent_run_id="AR-L2")
+		self.assertEqual(seen, [True])
+
+	def test_a_rerun_answers_repeated_mutations_from_the_record_and_never_executes_them(self):
+		params = {"path": "a", "content": "x"}
+		first = self._run_mutation("AR-L3", "tc-1", params, {"written": 1})
+		self.assertTrue(first["ok"])
+		self.assertEqual(len(self.sent_calls()), 1)
+		# the run is executed again: the model re-issues the write under a NEW tool_call id
+		self.assertEqual(dx.begin_run_attempt("AR-L3"), 1)
+		again = dx.dispatch("fs.write", params, self.ctx(), call_id="tc-NEW", agent_run_id="AR-L3")
+		self.assertEqual(again, first)
+		self.assertEqual(len(self.sent_calls()), 1)  # not sent again
+		# a genuinely new call in the re-run still runs
+		self._run_mutation("AR-L3", "tc-2", {"path": "b", "content": "y"}, {"written": 2})
+		self.assertEqual(len(self.sent_calls()), 2)
+
+	def test_a_rerun_repeat_of_an_unfinished_call_reports_already_dispatched(self):
+		sig = dx._call_sig("fs.write", {"path": "a", "content": "x"})
+		dx._ledger_put("AR-L4", "tc-1", {"sig": sig, "op": "fs.write", "at": 1, "final": None})
+		dx.begin_run_attempt("AR-L4")
+		res = dx.dispatch(
+			"fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="tc-9", agent_run_id="AR-L4"
+		)
+		self.assertEqual(res["error"]["code"], "already_dispatched")
+		self.publish.assert_not_called()
+
+	def test_without_a_rerun_identical_mutations_run_normally(self):
+		params = {"path": "a", "content": "x"}
+		self._run_mutation("AR-L5", "tc-1", params, {"written": 1})
+		self._run_mutation("AR-L5", "tc-2", params, {"written": 2})  # the model meant it twice
+		self.assertEqual(len(self.sent_calls()), 2)
+
+	def test_reads_are_never_replayed(self):
+		self._answer("r-1", {"content": "v1"})
+		dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="r-1", agent_run_id="AR-L6")
+		self.assertEqual(dx.begin_run_attempt("AR-L6"), 0)
+		self._answer("r-2", {"content": "v2"})
+		res = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="r-2", agent_run_id="AR-L6")
+		self.assertEqual(res["data"], {"content": "v2"})
+
+	def test_oversized_results_are_compacted_in_the_ledger(self):
+		big = {"ok": True, "op": "exec.run", "workspace": "w", "data": {"out": "x" * (64 * 1024)}}
+		compact = dx._compact_final(big)
+		self.assertTrue(compact["ok"])
+		self.assertIsNone(compact["data"])
+		self.assertIn("already ran", compact["note"])
+		small = {"ok": True, "data": {"n": 1}}
+		self.assertIs(dx._compact_final(small), small)
 
 
 class TestSubmit(DesktopExecutorTestCase):

@@ -21,11 +21,19 @@ Agent Run) and MUST run on the loop/main thread; ``handler.execute(prepared)`` o
 talks to Redis and runs in ``asyncio.to_thread``. Calling ``handler(**kwargs)``
 does both in sequence (tests, plain callers).
 
+Pin token (N8). The handlers refuse to run unless the call carries ``_dx_pin``, an HMAC
+that only ``sdk_tools`` (the ``pin_run_context`` path of a Desktop-pinned agent run) can
+mint, bound to the run, executor and user. Flows, procedures, ``tool_invocation.invoke_tool``
+and direct API calls cannot mint it, so they cannot drive a desktop with self-chosen ids.
+
 See PLAN.md §3.7-3.8 for limits and specifications.
 """
 
 import functools
+import hashlib
+import hmac
 import json
+import os
 import re
 import unicodedata
 
@@ -117,15 +125,34 @@ def _parse_runtime_context(value) -> dict:
 	return parsed if isinstance(parsed, dict) else {}
 
 
+# Process-local secret: the token is minted and checked inside the same worker process
+# (``on_invoke_tool`` -> ``prepare``), and is never persisted or sent anywhere.
+_PIN_SECRET = os.urandom(32)
+
+
+def issue_pin_token(agent_run_id, executor_id, user) -> str:
+	"""HMAC binding a desktop tool call to (run, executor, user). Minted by ``sdk_tools`` only."""
+	message = "\0".join(str(part or "") for part in (agent_run_id, executor_id, user)).encode("utf-8")
+	return hmac.new(_PIN_SECRET, message, hashlib.sha256).hexdigest()
+
+
+def _pin_token_valid(token, agent_run_id, executor_id, user) -> bool:
+	if not token or not isinstance(token, str):
+		return False
+	return hmac.compare_digest(token, issue_pin_token(agent_run_id, executor_id, user))
+
+
 def _validate_executor_context(
 	_dx_executor_id: str,
 	_dx_fingerprint: str,
 	_dx_user: str,
 	agent_run_id: str,
+	_dx_pin: str = None,
 ) -> dict:
 	"""Verify that the pinned executor context belongs to this run.
 
 	Reads the Agent Run (main thread only: it touches the database) to confirm:
+	- the call carries a valid ``_dx_pin`` token (only ``sdk_tools`` mints it for a pinned run)
 	- the session user is the pinned user, or Administrator (the system context that
 	  drains queued runs; the run OWNER is what carries the identity)
 	- the run owner is _dx_user
@@ -137,6 +164,13 @@ def _validate_executor_context(
 	"""
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Desktop tools are not available in guest sessions."))
+
+	# N8: only a Desktop-pinned agent run may call these handlers.
+	if not _pin_token_valid(_dx_pin, agent_run_id, _dx_executor_id, _dx_user):
+		frappe.throw(
+			_("Desktop tools can only be used by an agent run that is pinned to Huf Desktop."),
+			frappe.PermissionError,
+		)
 
 	if frappe.session.user not in (_dx_user, "Administrator"):
 		frappe.throw(
@@ -188,6 +222,11 @@ def _validate_executor_context(
 	}
 
 
+def _in_web_request() -> bool:
+	"""True inside a web request (SSE stream, ``now=1``); False in RQ jobs."""
+	return bool(getattr(frappe.local, "request", None))
+
+
 def _import_dispatch_lazily():
 	"""Import dispatch lazily (kept as a seam so tests can substitute it)."""
 	from huf.ai import desktop_executor
@@ -200,6 +239,7 @@ _IDENTITY_KEYS = (
 	"_dx_executor_id",
 	"_dx_fingerprint",
 	"_dx_user",
+	"_dx_pin",
 	"agent_run_id",
 	"call_id",
 	"conversation_id",
@@ -224,6 +264,7 @@ def _desktop_tool(op: str):
 				ident["_dx_fingerprint"],
 				ident["_dx_user"],
 				ident["agent_run_id"],
+				ident["_dx_pin"],
 			)
 			return {
 				"op": op,
@@ -233,6 +274,8 @@ def _desktop_tool(op: str):
 				"conversation_id": ident["conversation_id"],
 				"agent_run_id": ident["agent_run_id"],
 				"timeout_ms": timeout_ms,
+				# Decided here (the handler runs on the request/job thread, ``execute`` in a worker).
+				"web_request": _in_web_request(),
 			}
 
 		def execute(prepared):

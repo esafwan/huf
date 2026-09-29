@@ -237,6 +237,12 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 			agent_run_id=self.run_name,
 		)
 		args.update(over)
+		# a pin minted for exactly these values (what sdk_tools does), so each test still
+		# reaches the check it is about
+		args.setdefault(
+			"_dx_pin",
+			desktop_workspace.issue_pin_token(args["agent_run_id"], args["_dx_executor_id"], args["_dx_user"]),
+		)
 		return desktop_workspace._validate_executor_context(**args)
 
 	def test_runtime_context_is_a_json_string_on_the_row(self):

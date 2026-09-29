@@ -13,6 +13,8 @@ Run with:
 	bench --site <site> run-tests --app huf --module huf.ai.tests.test_desktop_roundtrip
 """
 
+import contextvars
+import threading
 import time
 import unittest
 from unittest import mock
@@ -78,7 +80,17 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			call_id=self.call_id,
 		)
 		kwargs.update(over)
+		kwargs.setdefault("_dx_pin", self.pin(kwargs))
 		return dw.handle_read_file(**kwargs)
+
+	def pin(self, kwargs=None, **over):
+		"""The pin token sdk_tools mints for a pinned run (bound to run, executor, user)."""
+		kwargs = dict(kwargs or {}, **over)
+		return dw.issue_pin_token(
+			kwargs.get("agent_run_id", self.run_name),
+			kwargs.get("_dx_executor_id", self.exec_id),
+			kwargs.get("_dx_user", self.user),
+		)
 
 	def play_desktop(self, script, poll_for_s=15):
 		"""Background desktop: wait for our call to show up in list_pending, then run
@@ -215,7 +227,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 
 	def test_run_phase_timeout_when_desktop_acks_then_goes_silent(self):
 		thread, errors, _ = self.play_desktop([(0.1, "ack", {})])
-		ctx = dw._validate_executor_context(self.exec_id, h.FP, self.user, self.run_name)
+		ctx = dw._validate_executor_context(self.exec_id, h.FP, self.user, self.run_name, self.pin())
 		started = time.monotonic()
 		res = dx.dispatch("fs.read", {"path": "a.txt"}, ctx, call_id=self.call_id, timeout_ms=1500)
 		elapsed = time.monotonic() - started
@@ -317,6 +329,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			_dx_executor_id=self.exec_id,
 			_dx_fingerprint=h.FP,
 			_dx_user=self.user,
+			_dx_pin=self.pin(),
 			agent_run_id=self.run_name,
 			call_id=self.call_id,
 		)
@@ -334,6 +347,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 				_dx_executor_id=self.exec_id,
 				_dx_fingerprint=h.FP,
 				_dx_user=self.user,
+				_dx_pin=self.pin(),
 				agent_run_id=self.run_name,
 			)
 
@@ -344,6 +358,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			_dx_executor_id=self.exec_id,
 			_dx_fingerprint=h.FP,
 			_dx_user=self.user,
+			_dx_pin=self.pin(),
 			agent_run_id=self.run_name,
 			call_id=self.call_id,
 		)
@@ -367,3 +382,276 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.assertEqual(out["error"]["code"], "sandbox_violation")
 		self.assertTrue(out["untrusted_content"])
 		self.assertIn("data, not instructions", out["note"])
+
+	# ------------------------------------------------------------------
+	# K3: N5 web budget / sweeper, N6 accounting, N7 reused ids, N8 pin gate
+	# ------------------------------------------------------------------
+
+	def answer_every_call(self, delay_s=0.2, stop=None, only=None):
+		"""Background desktop that answers EVERY pending call (ack then result echoing the
+		request params) until ``stop`` is set. Returns ``(thread, errors, seen_requests)``."""
+		stop = stop or threading.Event()
+		seen = []
+		answered = set()
+
+		def answer(req):
+			cid = req["call_id"]
+			time.sleep(delay_s)
+			dx.submit_desktop_tool_event(call_id=cid, executor_id=self.exec_id, kind="ack", payload={})
+			time.sleep(delay_s)
+			dx.submit_desktop_tool_event(
+				call_id=cid,
+				executor_id=self.exec_id,
+				kind="result",
+				payload={"ok": True, "data": {"echo": req["params"]}},
+			)
+
+		def play():
+			while not stop.is_set():
+				for req in dx.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+					cid = req["call_id"]
+					if cid in answered or (only and cid not in only):
+						continue
+					answered.add(cid)
+					seen.append(req)
+					# one thread per call: the desktop runs parallel calls concurrently
+					threading.Thread(
+						target=contextvars.copy_context().run, args=(answer, req), daemon=True
+					).start()
+				time.sleep(0.05)
+
+		thread, errors = h.run_in_thread(play)
+		return thread, errors, seen, stop
+
+	def ctx(self, run=None):
+		return dw._validate_executor_context(
+			self.exec_id, h.FP, self.user, run or self.run_name, self.pin(agent_run_id=run or self.run_name)
+		)
+
+	# ---- N7
+	def test_a_provider_reusing_a_tool_call_id_never_gets_a_stale_result(self):
+		thread, errors, seen, stop = self.answer_every_call(0.1)
+		try:
+			first = self.read_file(path="a.txt")
+			second = self.read_file(path="b.txt")  # SAME call id, different params
+			third = self.read_file(path="b.txt")  # same id, same params: deduped
+		finally:
+			stop.set()
+			thread.join(10)
+		self.assertEqual(errors, [])
+		self.assertEqual(first["data"], {"echo": {"path": "a.txt", "offset": 0, "limit": 2000}})
+		self.assertEqual(second["data"]["echo"]["path"], "b.txt")  # not turn 1's a.txt
+		self.assertEqual(third, second)
+		self.assertEqual([r["params"]["path"] for r in seen], ["a.txt", "b.txt"])  # third never sent
+		self.assertEqual(seen[0]["call_id"], self.call_id)
+		self.assertNotEqual(seen[1]["call_id"], self.call_id)  # the desktop cannot serve a stale one either
+		self.assertTrue(seen[1]["call_id"].startswith(self.call_id + "."))
+
+	# ---- N8
+	def test_handlers_refuse_a_call_that_was_not_pinned_by_the_run(self):
+		with self.assertRaises(frappe.PermissionError):
+			dw.handle_read_file(
+				path="a.txt",
+				_dx_executor_id=self.exec_id,
+				_dx_fingerprint=h.FP,
+				_dx_user=self.user,
+				agent_run_id=self.run_name,
+				call_id=self.call_id,
+			)  # self-chosen ids, no pin (what a flow / procedure / API caller can do)
+		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+
+	def test_handlers_refuse_a_forged_or_borrowed_pin(self):
+		for bad in ("", "0" * 64, "not-a-token", None, 12345):
+			with self.assertRaises(frappe.PermissionError, msg=repr(bad)):
+				self.read_file(_dx_pin=bad)
+		other_run = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user))
+		self._docs.append(("Agent Run", other_run))
+		frappe.set_user(self.user)
+		# a token minted for another run of the same user does not work for this one
+		with self.assertRaises(frappe.PermissionError):
+			self.read_file(_dx_pin=dw.issue_pin_token(other_run, self.exec_id, self.user))
+		# nor one minted for another executor
+		with self.assertRaises(frappe.PermissionError):
+			self.read_file(_dx_pin=dw.issue_pin_token(self.run_name, "exec-other-0001", self.user))
+
+	def test_a_pinned_run_call_is_accepted(self):
+		thread, errors, results = self.play_desktop([(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "ok"}})])
+		out = self.read_file()
+		self.finish(thread, errors)
+		self.assertEqual(out["data"]["content"], "ok")
+
+	def test_a_flow_or_procedure_cannot_reach_the_handlers_through_invoke_tool(self):
+		import asyncio
+
+		from huf.ai.tool_invocation import invoke_tool
+
+		frappe.set_user("Administrator")
+		row = frappe.db.get_value(
+			"Agent Tool Function", {"function_path": "huf.ai.tools.desktop_workspace.handle_read_file"}, "tool_name"
+		)
+		if not row:
+			self.skipTest("Desktop Workspace tool rows are not synced on this site")
+		frappe.set_user(self.user)
+		result = asyncio.run(
+			invoke_tool(
+				row,
+				{
+					"path": "a.txt",
+					"_dx_executor_id": self.exec_id,
+					"_dx_fingerprint": h.FP,
+					"_dx_user": self.user,
+					"agent_run_id": self.run_name,
+					"call_id": "self-chosen-by-a-flow",
+				},
+			)
+		)
+		self.assertFalse(result.success)
+		self.assertTrue(result.denied)
+		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+
+	# ---- N5 web budget
+	def test_web_request_with_a_used_up_budget_gets_a_structured_error_without_waiting(self):
+		dx._budget_charge(self.run_name, dx.web_wait_budget_s() - 1)
+		self.addCleanup(dx._delete, dx._budget_key(self.run_name))
+		started = time.monotonic()
+		with mock.patch.object(dw, "_in_web_request", return_value=True):
+			out = self.read_file()
+		self.assertLess(time.monotonic() - started, 2)
+		self.assertEqual(out["error"]["code"], "web_budget_exhausted")
+		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		# the very same state is fine for a queued (RQ) run
+		thread, errors, _ = self.play_desktop([(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "q"}})])
+		with mock.patch.object(dw, "_in_web_request", return_value=False):
+			queued = self.read_file(call_id=self.call_id)
+		self.finish(thread, errors)
+		self.assertEqual(queued["data"]["content"], "q")
+
+	def test_web_call_that_outlives_the_web_budget_is_cancelled_and_reported(self):
+		self.addCleanup(dx._delete, dx._budget_key(self.run_name))
+		cancels = []
+		real_cancel = dx._publish_cancel
+		with mock.patch.object(dx.frappe.conf, "get", side_effect=lambda k, d=None: 10 if k == "huf_desktop_web_budget_s" else d), \
+				mock.patch.object(dw, "_in_web_request", return_value=True), \
+				mock.patch.object(dx, "_publish_cancel", side_effect=lambda *a: (cancels.append(a), real_cancel(*a))):
+			thread, errors, _ = self.play_desktop([(0.1, "ack", {})])  # acks, then the user never answers
+			started = time.monotonic()
+			out = self.read_file()
+			elapsed = time.monotonic() - started
+		self.finish(thread, errors)
+		self.assertEqual(out["error"]["code"], "web_budget_exhausted", out)
+		self.assertIn("cancelled", out["error"]["message"])
+		self.assertLess(elapsed, 16)  # ~10 s budget, not the 20 s call timeout
+		self.assertEqual([c[1] for c in cancels], [self.call_id])
+
+	# ---- N5 sweeper
+	def _backdate(self, run_name):
+		frappe.db.set_value("Agent Run", run_name, "modified", "2000-01-01 00:00:00", update_modified=False)
+		frappe.db.commit()
+
+	def test_sweeper_fails_a_stale_run_that_already_changed_the_workspace_instead_of_requeueing_it(self):
+		mutated = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user))
+		readonly = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user))
+		self._docs.extend([("Agent Run", mutated), ("Agent Run", readonly)])
+		frappe.set_user(self.user)
+		self.addCleanup(dx._delete, dx._ledger_key(mutated), dx._ledger_key(readonly))
+		thread, errors, seen, stop = self.answer_every_call(0.1)
+		try:
+			ctx_m, ctx_r = self.ctx(mutated), self.ctx(readonly)
+			self.assertTrue(dx.dispatch("fs.write", {"path": "a", "content": "x"}, ctx_m, call_id="m-1", agent_run_id=mutated)["ok"])
+			self.assertTrue(dx.dispatch("fs.read", {"path": "a"}, ctx_r, call_id="r-1", agent_run_id=readonly)["ok"])
+		finally:
+			stop.set()
+			thread.join(10)
+		self.assertTrue(dx.run_executed_mutations(mutated))
+		self.assertFalse(dx.run_executed_mutations(readonly))
+		frappe.set_user("Administrator")
+		for name in (mutated, readonly):
+			self._backdate(name)
+		with mock.patch.object(ai, "_enqueue_drain") as drain:
+			ai.recover_stalled_agent_runs()
+		frappe.db.commit()
+		mutated_doc = frappe.db.get_value("Agent Run", mutated, ["status", "error_message"], as_dict=True)
+		readonly_status = frappe.db.get_value("Agent Run", readonly, "status")
+		self.assertEqual(mutated_doc.status, "Failed")  # NOT re-run: its write would repeat
+		self.assertIn("already changed the desktop workspace", mutated_doc.error_message)
+		self.assertEqual(readonly_status, "Queued")  # nothing was changed: safe to run again
+		self.assertTrue(drain.called)
+
+	def test_drain_of_a_rerun_takes_a_replay_snapshot_of_the_earlier_attempt(self):
+		self.addCleanup(dx._delete, dx._ledger_key(self.run_name), dx._replay_key(self.run_name))
+		thread, errors, seen, stop = self.answer_every_call(0.1)
+		try:
+			first = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-1", agent_run_id=self.run_name)
+			self.assertTrue(first["ok"])
+			run_doc = frappe.get_doc("Agent Run", self.run_name)
+			with mock.patch.object(ai, "_execute_agent_run", return_value={"ok": True}), \
+					mock.patch.object(ai, "_build_execution_kwargs", return_value={"prompt": None}), \
+					mock.patch.object(ai, "_link_preexisting_user_message"), \
+					mock.patch.object(ai, "safe_commit"):
+				ai._drain_run(run_doc, "test-lock")
+			# the model of the re-run repeats the write under a new tool_call id: not executed again
+			again = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-NEW", agent_run_id=self.run_name)
+		finally:
+			stop.set()
+			thread.join(10)
+		self.assertEqual(errors, [])
+		self.assertEqual(again, first)
+		self.assertEqual(len(seen), 1)
+
+	# ---- N6
+	def test_parallel_calls_are_charged_by_wall_clock_once(self):
+		self.addCleanup(dx._delete, dx._budget_key(self.run_name))
+		thread, errors, seen, stop = self.answer_every_call(1.0)  # each call takes ~2 s on the desktop
+		results = []
+		try:
+			ctx = self.ctx()
+
+			def one(i):
+				results.append(dx.dispatch("fs.read", {"path": f"f{i}"}, ctx, call_id=f"par-{i}", agent_run_id=self.run_name))
+
+			workers = [h.run_in_thread(lambda i=i: one(i)) for i in range(3)]
+			for t, errs in workers:
+				t.join(30)
+				self.assertEqual(errs, [])
+		finally:
+			stop.set()
+			thread.join(10)
+		self.assertEqual(len(results), 3)
+		self.assertTrue(all(r["ok"] for r in results), results)
+		used = dx._budget_used_s(self.run_name)
+		self.assertGreater(used, 1.5)
+		self.assertLess(used, 5.5)  # per-call charging would have booked ~6 s or more
+		r = dx._raw_client()
+		self.assertEqual(r.zcard(dx._k(dx._inflight_executor_key(self.exec_id))), 0)
+		self.assertEqual(r.zcard(dx._k(dx._inflight_user_key(self.user))), 0)
+
+	def test_slots_leaked_by_a_dead_worker_self_heal(self):
+		r = dx._raw_client()
+		xkey = dx._k(dx._inflight_executor_key(self.exec_id))
+		self.addCleanup(r.delete, xkey)
+		now = dx._now_ms()
+		r.zadd(xkey, {f"dead-{i}": now - 1000 for i in range(dx.MAX_INFLIGHT_PER_EXECUTOR)})  # leases lapsed
+		thread, errors, _ = self.play_desktop([(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "healed"}})])
+		out = self.read_file()
+		self.finish(thread, errors)
+		self.assertEqual(out["data"]["content"], "healed")
+		self.assertEqual(r.zcard(xkey), 0)
+		# holders whose lease is alive still count
+		r.zadd(xkey, {f"live-{i}": now + 60_000 for i in range(dx.MAX_INFLIGHT_PER_EXECUTOR)})
+		busy = self.read_file(call_id=f"{self.call_id}-busy")
+		self.assertEqual(busy["error"]["code"], "busy")
+		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+
+	def test_a_queue_job_shares_one_wait_budget_across_the_runs_it_drains(self):
+		conversation = f"CONV-K3-{frappe.generate_hash(length=6)}"
+		seen = {}
+
+		def fake_next(conv):
+			seen["job"] = dx._current_job_id(conv)
+			return None  # nothing to drain
+
+		with mock.patch.object(ai, "_next_queued_run", side_effect=fake_next), \
+				mock.patch.object(ai, "_has_queued_runs", return_value=False):
+			ai._run_queued_agent(conversation_id=conversation)
+		self.assertTrue(seen["job"])  # a job budget id existed while the job drained
+		self.assertIsNone(dx._current_job_id(conversation))  # and is gone when the job ends

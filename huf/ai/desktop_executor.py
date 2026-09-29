@@ -40,9 +40,13 @@ label}`` (the run's pinned desktop context). ``_dx_*`` keys are NOT accepted.
     huf:dx:res:<call_id>         list   ack / approval_pending / result / error events
     huf:dx:done:<call_id>        value  first-terminal-wins flag
     huf:dx:final:<user>:<run>:<call_id>  value  cached final result (idempotent redispatch)
-    huf:dx:inflight:x:<executor_id>      int    in-flight dispatches for an executor (cap)
-    huf:dx:inflight:u:<user>             int    in-flight dispatches for a user (cap)
+    huf:dx:inflight:x:<executor_id>      zset   slot holders (token -> lease expiry ms) for an executor (cap)
+    huf:dx:inflight:u:<user>             zset   slot holders (token -> lease expiry ms) for a user (cap)
     huf:dx:budget:<agent_run_id>         int    milliseconds of desktop waiting spent by a run
+    huf:dx:budget:job:<job_id>           int    milliseconds spent by all runs drained under one queue job
+    huf:dx:job:<conversation_id>         value  id of the queue drain job currently holding the conversation
+    huf:dx:ledger:<agent_run_id>         hash   call_id -> {sig, op, at, final} for every call a run sent
+    huf:dx:replay:<agent_run_id>         hash   ledger snapshot taken when a run is executed again
 
 Identity. ``agent_run_id`` / ``conversation_id`` / ``call_id`` are pinned by the
 server (``sdk_tools.create_function_tool(pin_run_context=True)``): the LLM cannot
@@ -53,17 +57,37 @@ died (stash still present) is *adopted* (wait on the existing result list, nothi
 is published again) and the desktop's own call_id LRU covers the rest. A wholly
 new LLM turn mints new tool_call_ids and is a new call by design.
 
-Bounded waiting (H2). A pending call holds a worker (RQ or web) for as long as it
-waits, so the wait is bounded three ways: at most ``MAX_INFLIGHT_PER_EXECUTOR`` /
-``MAX_INFLIGHT_PER_USER`` concurrent dispatches (excess returns ``busy``
-immediately), ``HARD_CAP_S`` per call, and a per-run budget
-(``run_wait_budget_s``: the queue job timeout minus a margin for LLM time) that
-ends further calls with ``budget_exhausted`` so a run's total desktop wait can
-never reach the drain job's timeout. On the streaming / ``now=1`` paths the wait
-happens inside the web request: the same bounds apply, but no SSE bytes are sent
-while a call is pending, so a proxy read timeout shorter than the wait can cut the
-request (the call keeps running on the desktop and its result is discarded).
-Keep-alive comments on the SSE stream are not implemented.
+Bounded waiting (H2, N5, N6). A pending call holds a worker (RQ or web) for as long
+as it waits, so the wait is bounded several ways:
+
+* at most ``MAX_INFLIGHT_PER_EXECUTOR`` / ``MAX_INFLIGHT_PER_USER`` concurrent
+  dispatches (excess returns ``busy`` immediately). Slots are holders in a zset with a
+  short lease (``SLOT_LEASE_S``) that the waiter refreshes every poll slice; a worker
+  that dies simply stops refreshing and its slot is reaped by the next acquirer, so a
+  crash cannot leak capacity;
+* ``HARD_CAP_S`` per call;
+* a per-run wait budget (``run_wait_budget_s``: the queue job timeout minus a margin
+  for LLM time). It is charged by WALL CLOCK once per dispatch window (the time during
+  which at least one call of the run is in flight), not once per parallel call;
+* a shared per-job budget: every run drained under one queue job (one 600 s RQ
+  timeout) also charges ``huf:dx:budget:job:<id>``, so the runs together cannot reach
+  the job timeout (``begin_job_budget`` / ``end_job_budget``);
+* inside a web request (SSE stream route, ``now=1``) the total desktop wait of the run
+  is capped at ``web_wait_budget_s`` (default 90 s, override ``huf_desktop_web_budget_s``
+  in site config), below gunicorn's 120 s default timeout. Exhausting it returns
+  ``web_budget_exhausted`` and a running call is cancelled. The SSE stream also emits a
+  ``: keep-alive`` comment every 15 s while a call is pending
+  (``agent_stream_renderer``); other stream endpoints (``api/v1/responses_stream``) do
+  not, and rely on the 90 s cap.
+
+Idempotency and re-runs (N5, N7). Every call is recorded in a per-run ledger keyed by
+call_id with a hash of ``(op, canonical params)``. A provider that reuses tool_call ids
+("0", "call_1") with different params gets a fresh wire call id, never a stale cached
+result, and never the desktop's own call_id cache either. The ledger also lets the
+stale-run sweeper refuse to re-run a run that already changed the workspace
+(:func:`run_executed_mutations`); if such a run is executed again anyway,
+:func:`begin_run_attempt` snapshots the ledger and a repeated mutating call is answered
+from the recorded result instead of running again.
 
 Threading. :func:`dispatch` runs in an ``asyncio.to_thread`` worker. It touches
 only Redis and ``publish_realtime``; it never reads the database and logs through
@@ -75,6 +99,7 @@ import json
 import math
 import pickle
 import re
+import threading
 import time
 import uuid
 
@@ -101,6 +126,15 @@ RUN_WAIT_MIN_BUDGET_S = 60
 # A call is not started with less than this much budget left.
 RUN_WAIT_MIN_CALL_S = 5
 DEFAULT_QUEUE_JOB_TIMEOUT_S = 600
+# Total desktop wait of a run inside a WEB request (SSE stream, ``now=1``). Must stay below
+# gunicorn's default ``--timeout`` (Frappe ``http_timeout``, 120 s). Site config override:
+# ``huf_desktop_web_budget_s``.
+WEB_WAIT_BUDGET_S = 90
+# A slot holder is reaped when its lease is not refreshed for this long (worker died).
+SLOT_LEASE_S = 15
+# Per-run call ledger (idempotency, sweeper guard): must outlive the stale-run sweep window.
+LEDGER_TTL_S = 24 * 60 * 60
+LEDGER_RESULT_MAX_BYTES = 32 * 1024
 MAX_LEASES_PER_USER = 8
 NONTERMINAL_PAYLOAD_MAX_BYTES = 4 * 1024
 REQUEST_PARAMS_MAX_BYTES = 512 * 1024
@@ -128,6 +162,8 @@ OP_CAPABILITY = {
 	"exec.run": "exec",
 }
 VALID_OPS = frozenset(OP_CAPABILITY)
+# Ops with side effects: never executed a second time for the same run (N5).
+MUTATING_OPS = frozenset({"fs.write", "fs.edit", "fs.mkdir", "fs.move", "fs.trash", "exec.run"})
 VALID_CAPABILITIES = frozenset(OP_CAPABILITY.values())
 # Ops whose payload carries attacker-influenceable content (file text, names, command output).
 UNTRUSTED_OPS = frozenset({"ws.info", "fs.list", "fs.read", "fs.search", "exec.run"})
@@ -205,7 +241,20 @@ def _inflight_user_key(user):
 
 
 def _budget_key(agent_run_id):
+	"""Budget counter key. ``agent_run_id`` may also be ``job:<job_id>`` (shared job budget)."""
 	return f"huf:dx:budget:{agent_run_id}"
+
+
+def _job_key(conversation_id):
+	return f"huf:dx:job:{conversation_id}"
+
+
+def _ledger_key(agent_run_id):
+	return f"huf:dx:ledger:{agent_run_id}"
+
+
+def _replay_key(agent_run_id):
+	return f"huf:dx:replay:{agent_run_id}"
 
 
 def derive_call_id(agent_run_id, tool_call_id):
@@ -691,14 +740,38 @@ def _publish_cancel(executor_id, call_id, user, reason):
 		_log_failure("desktop_executor: cancel publish failed")
 
 
+def web_wait_budget_s():
+	"""Total seconds a run may wait on the desktop inside one WEB request (N5)."""
+	value = WEB_WAIT_BUDGET_S
+	try:
+		configured = frappe.conf.get("huf_desktop_web_budget_s")
+		if configured is not None:
+			value = int(configured)
+	except Exception:
+		pass
+	return max(RUN_WAIT_MIN_CALL_S * 2, value)
+
+
+def _in_web_request():
+	"""True inside a web request (SSE stream route, ``now=1``), False in RQ jobs and scripts."""
+	try:
+		return bool(getattr(frappe.local, "request", None))
+	except Exception:
+		return False
+
+
 def _acquire_slots(executor_id, user):
 	"""Take one in-flight slot for the executor and one for the user.
 
-	Returns the list of held physical keys, or None when either cap is reached
-	(``busy``). Counters carry a TTL so a crashed worker cannot leak a slot forever.
+	Returns ``(token, [physical keys])`` or None when either cap is reached (``busy``).
+	A slot is a holder in a zset scored by its lease expiry. Expired holders (a worker
+	that died and stopped refreshing, see :func:`_slots_heartbeat`) are pruned before
+	counting, so capacity self-heals instead of leaking. The holder is added first and
+	counted after, so concurrent acquirers can never exceed the cap.
 	"""
 	r = _raw_client()
-	ttl = HARD_CAP_S + STASH_TTL_GRACE_S
+	token = uuid.uuid4().hex
+	expiry = _now_ms() + SLOT_LEASE_S * 1000
 	held = []
 	try:
 		for key, cap in (
@@ -706,44 +779,281 @@ def _acquire_slots(executor_id, user):
 			(_inflight_user_key(user), MAX_INFLIGHT_PER_USER),
 		):
 			pk = _k(key)
-			count = r.incr(pk)
-			r.expire(pk, ttl)
+			r.zremrangebyscore(pk, "-inf", _now_ms())
+			r.zadd(pk, {token: expiry})
+			r.expire(pk, HARD_CAP_S + STASH_TTL_GRACE_S)
 			held.append(pk)
-			if count > cap:
-				_release_slots(held)
+			if r.zcard(pk) > cap:
+				_release_slots((token, held))
 				return None
 	except Exception:
-		_release_slots(held)
+		_release_slots((token, held))
 		raise
-	return held
+	return token, held
 
 
-def _release_slots(held):
+def _slots_heartbeat(slots):
+	"""Refresh the lease of the held slots (called by the waiter every poll slice)."""
+	token, keys = slots
 	try:
 		r = _raw_client()
-		for pk in held:
-			if r.decr(pk) < 0:
-				r.set(pk, 0, ex=HARD_CAP_S + STASH_TTL_GRACE_S)
+		expiry = _now_ms() + SLOT_LEASE_S * 1000
+		for pk in keys:
+			r.zadd(pk, {token: expiry})
 	except Exception:
 		pass
 
 
-def _budget_used_s(agent_run_id):
-	try:
-		raw = _raw_client().get(_k(_budget_key(agent_run_id)))
-		return int(raw) / 1000.0 if raw is not None else 0.0
-	except Exception:
-		return 0.0
-
-
-def _budget_charge(agent_run_id, elapsed_s):
+def _release_slots(slots):
+	token, keys = slots
 	try:
 		r = _raw_client()
-		bk = _k(_budget_key(agent_run_id))
+		for pk in keys:
+			r.zrem(pk, token)
+	except Exception:
+		pass
+
+
+# Wall-clock accounting of dispatch windows (N6). Parallel calls of one run (and all runs of
+# one drain job) live in one worker process, so the window state is process-local: it dies
+# with the worker and can never leak. Only the closed-window total is written to Redis.
+_WINDOWS = {}
+_WINDOWS_LOCK = threading.Lock()
+
+
+def _scope_id(scope):
+	return f"{getattr(frappe.local, 'site', '') or ''}:{scope}"
+
+
+def _window_open(scope):
+	sid = _scope_id(scope)
+	with _WINDOWS_LOCK:
+		window = _WINDOWS.get(sid)
+		if window:
+			window[0] += 1
+		else:
+			_WINDOWS[sid] = [1, _monotonic()]
+
+
+def _window_open_elapsed_s(scope):
+	with _WINDOWS_LOCK:
+		window = _WINDOWS.get(_scope_id(scope))
+		return _monotonic() - window[1] if window else 0.0
+
+
+def _window_close(scope):
+	"""Close one call of the window. Returns the wall seconds to charge (only the last
+	call closing a window returns non-zero: the window's whole wall-clock length)."""
+	sid = _scope_id(scope)
+	with _WINDOWS_LOCK:
+		window = _WINDOWS.get(sid)
+		if not window:
+			return 0.0
+		window[0] -= 1
+		if window[0] > 0:
+			return 0.0
+		del _WINDOWS[sid]
+		return max(0.0, _monotonic() - window[1])
+
+
+def _budget_used_s(scope):
+	"""Seconds already charged to a scope (run id or ``job:<id>``) plus its open window."""
+	used = 0.0
+	try:
+		raw = _raw_client().get(_k(_budget_key(scope)))
+		used = int(raw) / 1000.0 if raw is not None else 0.0
+	except Exception:
+		used = 0.0
+	return used + _window_open_elapsed_s(scope)
+
+
+def _budget_charge(scope, elapsed_s):
+	try:
+		r = _raw_client()
+		bk = _k(_budget_key(scope))
 		r.incrby(bk, max(0, int(elapsed_s * 1000)))
 		r.expire(bk, run_wait_budget_s() + 2 * RUN_WAIT_MARGIN_S)
 	except Exception:
 		pass
+
+
+def begin_job_budget(conversation_id):
+	"""Mark the start of one queue drain job so every run it drains shares one wait budget."""
+	if not conversation_id:
+		return None
+	job_id = uuid.uuid4().hex
+	try:
+		_raw_client().set(_k(_job_key(conversation_id)), job_id, ex=DEFAULT_QUEUE_JOB_TIMEOUT_S * 2)
+	except Exception:
+		return None
+	return job_id
+
+
+def end_job_budget(conversation_id):
+	if not conversation_id:
+		return
+	try:
+		_delete(_job_key(conversation_id))
+	except Exception:
+		pass
+
+
+def _current_job_id(conversation_id):
+	if not conversation_id:
+		return None
+	try:
+		raw = _raw_client().get(_k(_job_key(conversation_id)))
+	except Exception:
+		return None
+	if raw is None:
+		return None
+	return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+# Per-run call ledger (N5, N7): advisory bookkeeping, never raises.
+
+
+def _call_sig(op, params):
+	"""Hash of (op, canonical params): identifies WHAT a call does, independent of its id."""
+	try:
+		canonical = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+	except (TypeError, ValueError):
+		canonical = repr(params)
+	return hashlib.sha256(f"{op}\0{canonical}".encode("utf-8")).hexdigest()
+
+
+def _ledger_get(agent_run_id, call_id):
+	if not agent_run_id:
+		return None
+	try:
+		raw = _raw_client().hget(_k(_ledger_key(agent_run_id)), call_id)
+		if raw is None:
+			return None
+		entry = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+		return entry if isinstance(entry, dict) else None
+	except Exception:
+		return None
+
+
+def _ledger_put(agent_run_id, call_id, entry):
+	if not agent_run_id:
+		return
+	try:
+		r = _raw_client()
+		lk = _k(_ledger_key(agent_run_id))
+		r.hset(lk, call_id, json.dumps(entry, default=str))
+		r.expire(lk, LEDGER_TTL_S)
+	except Exception:
+		_log_failure("desktop_executor: ledger write failed")
+
+
+def _ledger_entries(key):
+	try:
+		raw = _raw_client().hgetall(_k(key)) or {}
+	except Exception:
+		return {}
+	out = {}
+	for field, value in raw.items():
+		try:
+			field = field.decode() if isinstance(field, bytes) else field
+			entry = json.loads(value.decode() if isinstance(value, bytes) else value)
+			if isinstance(entry, dict):
+				out[field] = entry
+		except (TypeError, ValueError):
+			continue
+	return out
+
+
+def _compact_final(final):
+	"""What the ledger keeps of a result (bounded), used to answer a replayed call."""
+	try:
+		if len(json.dumps(final, default=str).encode("utf-8")) <= LEDGER_RESULT_MAX_BYTES:
+			return final
+	except (TypeError, ValueError):
+		pass
+	return {
+		"ok": bool(final.get("ok")),
+		"op": final.get("op"),
+		"workspace": final.get("workspace"),
+		"data": None,
+		"truncated": True,
+		"duration_ms": final.get("duration_ms", 0),
+		"note": "This call already ran in an earlier attempt of this run; its result was too large to keep.",
+	}
+
+
+def run_executed_mutations(agent_run_id):
+	"""True if this run already sent a state-changing call (write, edit, move, trash, exec) to a
+	desktop. The stale-run sweeper uses it to fail such a run instead of re-running it (N5)."""
+	if not agent_run_id:
+		return False
+	return any(e.get("op") in MUTATING_OPS for e in _ledger_entries(_ledger_key(agent_run_id)).values())
+
+
+def begin_run_attempt(agent_run_id):
+	"""Called when a run starts executing. If an earlier attempt of the same run already sent
+	mutating calls, snapshot them: a repeated identical call in this attempt is answered from
+	the recorded result and never runs again. Returns the number of recorded calls."""
+	if not agent_run_id:
+		return 0
+	try:
+		r = _raw_client()
+		rk = _k(_replay_key(agent_run_id))
+		r.delete(rk)
+		entries = {
+			cid: e for cid, e in _ledger_entries(_ledger_key(agent_run_id)).items() if e.get("op") in MUTATING_OPS
+		}
+		for cid, entry in entries.items():
+			r.hset(rk, cid, json.dumps(entry, default=str))
+		if entries:
+			r.expire(rk, LEDGER_TTL_S)
+		return len(entries)
+	except Exception:
+		_log_failure("desktop_executor: begin_run_attempt failed")
+		return 0
+
+
+def _replay_take(agent_run_id, op, sig):
+	"""Consume one recorded execution of an identical (op, params) call, or None."""
+	if not agent_run_id or op not in MUTATING_OPS:
+		return None
+	try:
+		entries = _ledger_entries(_replay_key(agent_run_id))
+		for cid, entry in sorted(entries.items(), key=lambda kv: kv[1].get("at") or 0):
+			if entry.get("sig") == sig:
+				_raw_client().hdel(_k(_replay_key(agent_run_id)), cid)
+				return entry
+	except Exception:
+		_log_failure("desktop_executor: replay lookup failed")
+	return None
+
+
+def _sig_conflict(user, agent_run_id, call_id, sig):
+	"""True if ``call_id`` was already used in this run for a DIFFERENT (op, params): the id was
+	reused by a provider (index-style tool_call ids) and must not reach any cache."""
+	entry = _ledger_get(agent_run_id, call_id)
+	if entry and entry.get("sig") not in (None, sig):
+		return True
+	try:
+		cached = _get(_final_key(user, agent_run_id, call_id))
+		if isinstance(cached, dict) and cached.get("_dx_sig") not in (None, sig):
+			return True
+		stash = _get(_request_key(call_id))
+		if isinstance(stash, dict):
+			stashed = stash.get("request") or {}
+			if stashed.get("op") and isinstance(stashed.get("params"), dict):
+				if _call_sig(stashed["op"], stashed["params"]) != sig:
+					return True
+	except Exception:
+		pass
+	return False
+
+
+def _fresh_call_id(call_id, sig):
+	fresh = f"{call_id}.{sig[:10]}"
+	if len(fresh) > 190:
+		fresh = "h_" + hashlib.sha256(fresh.encode("utf-8")).hexdigest()[:48]
+	return fresh
 
 
 def dispatch(
@@ -756,6 +1066,7 @@ def dispatch(
 	timeout_ms=None,
 	tool_name=None,
 	agent_name=None,
+	web_request=None,
 ):
 	"""Send one tool call to the pinned desktop executor and block for its result.
 
@@ -764,20 +1075,29 @@ def dispatch(
 	Server-side error codes in addition to the desktop set: ``desktop_offline``
 	(no live lease, returned immediately, nothing published), ``desktop_unreachable``
 	(lease present, no ack within 10 s; a cancel is published), ``busy`` (in-flight
-	cap reached, returned immediately), ``budget_exhausted`` (the run spent its
-	desktop wait budget), ``capability_unavailable``, ``duplicate_in_flight``,
+	cap reached, returned immediately), ``budget_exhausted`` (the run, or the
+	queue job it is drained under, spent its desktop wait budget), ``web_budget_exhausted`` (inside
+	a web request the desktop wait budget of ``web_wait_budget_s`` ran out; a call still running was
+	cancelled), ``already_dispatched`` (an earlier attempt of the run sent this call and no result
+	was kept), ``capability_unavailable``, ``duplicate_in_flight``,
 	``permission_denied``, ``cache_unavailable``.
 
 	``ctx`` is the pinned run context ``{executor_id, fingerprint, user, label}``.
-	Idempotent by ``(user, agent_run_id, call_id)``: a repeat of a finished call
-	returns the cached final result without touching the desktop; a repeat of a call
-	whose waiter died is adopted (see module docstring).
+	Idempotent by ``(user, agent_run_id, call_id)`` AND the hash of ``(op, params)``: a repeat
+	of a finished call returns the cached final result without touching the desktop; a repeat
+	of a call whose waiter died is adopted; a reused call id carrying different params is a
+	new call under a fresh wire id (see module docstring).
+
+	``web_request`` (default: detected from ``frappe.local.request``) selects the web wait
+	budget. ``dispatch`` runs in a worker thread, so the handler passes it explicitly.
 	"""
 	ctx = ctx if isinstance(ctx, dict) else {}
 	executor_id = ctx.get("executor_id")
 	user = ctx.get("user")
 	label = ctx.get("label")
 	call_id = str(call_id) if call_id else uuid.uuid4().hex
+	if web_request is None:
+		web_request = _in_web_request()
 
 	if op not in VALID_OPS:
 		return _error(op, label, "invalid_params", f"Unknown desktop operation: {op}")
@@ -785,13 +1105,18 @@ def dispatch(
 		return _error(op, label, "desktop_offline", "No desktop executor is attached to this run.")
 	if not isinstance(params, dict):
 		return _error(op, label, "invalid_params", "params must be an object")
+	# A call id is only ever bound to ONE (op, params): a provider that reuses ids ("0",
+	# "call_1") with different params gets a fresh wire id, never a stale cached result.
+	sig = _call_sig(op, params)
+	if _sig_conflict(user, agent_run_id, call_id, sig):
+		call_id = _fresh_call_id(call_id, sig)
 	# Idempotency, scoped to the user and the run.
 	final_key = _final_key(user, agent_run_id, call_id)
 	adopt = None
 	try:
 		cached = _get(final_key)
 		if isinstance(cached, dict):
-			return cached
+			return {k: v for k, v in cached.items() if k != "_dx_sig"}
 		stash = _get(_request_key(call_id))
 		if isinstance(stash, dict):
 			stashed = stash.get("request") or {}
@@ -805,6 +1130,21 @@ def dispatch(
 			adopt = stashed
 	except Exception:
 		adopt = None
+
+	# A run executed again (worker died, sweeper) must not repeat state-changing calls.
+	if adopt is None:
+		replayed = _replay_take(agent_run_id, op, sig)
+		if replayed is not None:
+			recorded = replayed.get("final")
+			if isinstance(recorded, dict):
+				return recorded
+			return _error(
+				op,
+				label,
+				"already_dispatched",
+				"An earlier attempt of this run already sent this call to Huf Desktop and its result "
+				"was not recorded. Check the workspace state before repeating it.",
+			)
 
 	# Size caps before anything is published.
 	try:
@@ -841,18 +1181,40 @@ def dispatch(
 			op, label, "capability_unavailable", f"The desktop executor does not support '{op}'."
 		)
 
-	# Per-run wait budget: keeps the run's total desktop wait below the queue job timeout.
+	# Wait budgets. Run scope: below the queue job timeout, or the (smaller) web budget inside a
+	# web request. Job scope: shared by every run drained under one queue job. A call is not
+	# started with less than RUN_WAIT_MIN_CALL_S left in any scope.
 	call_cap_s = float(HARD_CAP_S)
+	scopes = []
 	if agent_run_id:
-		remaining_budget = run_wait_budget_s() - _budget_used_s(agent_run_id)
+		scopes.append((agent_run_id, web_wait_budget_s() if web_request else run_wait_budget_s()))
+	job_id = _current_job_id(conversation_id) if not web_request else None
+	if job_id:
+		scopes.append((f"job:{job_id}", run_wait_budget_s()))
+	elif web_request and not agent_run_id:
+		call_cap_s = min(call_cap_s, float(web_wait_budget_s()))
+	web_limited = False
+	for scope, total_s in scopes:
+		remaining_budget = total_s - _budget_used_s(scope)
 		if remaining_budget < RUN_WAIT_MIN_CALL_S:
+			if web_request and scope == agent_run_id:
+				return _error(
+					op,
+					label,
+					"web_budget_exhausted",
+					f"Desktop calls made from a web request may wait at most {total_s}s in total and "
+					"this run used it up. Nothing was sent. Finish without the desktop or tell the "
+					"user to send the request again.",
+				)
 			return _error(
 				op,
 				label,
 				"budget_exhausted",
 				"This run has used up its time budget for waiting on Huf Desktop.",
 			)
-		call_cap_s = min(call_cap_s, remaining_budget)
+		if remaining_budget < call_cap_s:
+			call_cap_s = remaining_budget
+			web_limited = bool(web_request and scope == agent_run_id)
 
 	try:
 		timeout_ms = int(timeout_ms) if timeout_ms is not None else DEFAULT_CALL_TIMEOUT_MS
@@ -879,6 +1241,9 @@ def dispatch(
 	started = _monotonic()
 	stash_ttl = HARD_CAP_S + STASH_TTL_GRACE_S
 	final = None
+	window_scopes = [scope for scope, _total in scopes]
+	for scope in window_scopes:
+		_window_open(scope)
 	try:
 		adopt_window_s = None
 		if adopt is not None:
@@ -908,6 +1273,7 @@ def dispatch(
 				"timeout_ms": timeout_ms,
 				"approval_timeout_ms": APPROVAL_TIMEOUT_MS,
 			}
+			_ledger_put(agent_run_id, call_id, {"sig": sig, "op": op, "at": issued_at, "final": None})
 			try:
 				_setex(
 					_request_key(call_id),
@@ -939,10 +1305,13 @@ def dispatch(
 				hard_cap_s=call_cap_s,
 				adopt_window_s=adopt_window_s,
 				final_key=final_key,
+				on_tick=lambda: _slots_heartbeat(held),
 			)
 	finally:
-		if agent_run_id:
-			_budget_charge(agent_run_id, _monotonic() - started)
+		for scope in window_scopes:
+			charge_s = _window_close(scope)
+			if charge_s:
+				_budget_charge(scope, charge_s)
 		_release_slots(held)
 		try:
 			_delete(_request_key(call_id), _result_key(call_id))
@@ -950,11 +1319,32 @@ def dispatch(
 		except Exception:
 			pass
 
+	if web_limited and not final.get("ok") and final["error"]["code"] == "timeout":
+		final = _error(
+			op,
+			label,
+			"web_budget_exhausted",
+			f"The web request's desktop wait budget ({web_wait_budget_s()}s) ran out while this call "
+			"was running; it was cancelled on the desktop. Its effect is unknown, so check the "
+			"workspace state before repeating it.",
+			duration_ms=int((_monotonic() - started) * 1000),
+		)
 	if final.get("ok") or final["error"]["code"] not in ("cache_unavailable",):
 		try:
-			_setex(final_key, final, FINAL_CACHE_TTL_S)
+			_setex(final_key, {**final, "_dx_sig": sig}, FINAL_CACHE_TTL_S)
 		except Exception:
 			pass
+		if agent_run_id:
+			_ledger_put(
+				agent_run_id,
+				call_id,
+				{
+					"sig": sig,
+					"op": op,
+					"at": _now_ms(),
+					"final": _compact_final(final) if op in MUTATING_OPS else None,
+				},
+			)
 	return final
 
 
@@ -969,6 +1359,7 @@ def _wait(
 	hard_cap_s=HARD_CAP_S,
 	adopt_window_s=None,
 	final_key=None,
+	on_tick=None,
 ):
 	"""Block on the result list: ack phase, run phase, one approval extension, hard cap.
 
@@ -990,6 +1381,8 @@ def _wait(
 	extended = False
 
 	while True:
+		if on_tick:
+			on_tick()  # keep the slot lease alive while this worker is alive
 		remaining = min(phase_end, hard_end) - _monotonic()
 		if remaining <= 0:
 			popped = None

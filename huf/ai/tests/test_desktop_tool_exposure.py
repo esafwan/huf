@@ -280,6 +280,33 @@ class TestDesktopToolExposure(unittest.TestCase):
 		self.assertEqual(a["call_id"], b["call_id"])
 		self.assertEqual(len({a["call_id"], c["call_id"], d["call_id"]}), 3)
 
+	# N8: only the pinned-run path mints the token the handlers require
+	def test_pin_token_is_minted_for_the_pinned_run_and_a_model_supplied_one_is_discarded(self):
+		from huf.ai.tools.desktop_workspace import issue_pin_token
+
+		captured = self._invoke_with_run_ctx(
+			{"path": ".", "_dx_pin": "forged-by-the-model"},
+			{"agent_run_id": "AR-real", "conversation_id": "CONV-real"},
+		)
+		self.assertNotEqual(captured["_dx_pin"], "forged-by-the-model")
+		self.assertEqual(
+			captured["_dx_pin"], issue_pin_token("AR-real", LIVE["executor_id"], LIVE["user"])
+		)
+		# bound to the run: the token of another run is different
+		self.assertNotEqual(
+			captured["_dx_pin"], issue_pin_token("AR-other", LIVE["executor_id"], LIVE["user"])
+		)
+
+	def test_pin_token_verification_rejects_anything_but_the_exact_binding(self):
+		from huf.ai.tools import desktop_workspace as dw
+
+		token = dw.issue_pin_token("AR-1", "exec-1", "u@example.com")
+		self.assertTrue(dw._pin_token_valid(token, "AR-1", "exec-1", "u@example.com"))
+		for args in (("AR-2", "exec-1", "u@example.com"), ("AR-1", "exec-2", "u@example.com"), ("AR-1", "exec-1", "v@example.com")):
+			self.assertFalse(dw._pin_token_valid(token, *args))
+		for bad in (None, "", 5, "x" * 64):
+			self.assertFalse(dw._pin_token_valid(bad, "AR-1", "exec-1", "u@example.com"))
+
 	def test_derive_call_id_is_bounded_and_wire_safe(self):
 		from huf.ai.desktop_executor import derive_call_id
 

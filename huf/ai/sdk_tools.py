@@ -104,6 +104,7 @@ def _pin_run_identity(args_dict: dict, ctx) -> dict:
         if huf_ctx.get(key):
             args_dict[key] = huf_ctx[key]
     args_dict.pop("call_id", None)
+    args_dict.pop("_dx_pin", None)  # minted below by the caller, never taken from the model
     tool_call_id = getattr(ctx, "tool_call_id", None)
     if tool_call_id and args_dict.get("agent_run_id"):
         args_dict["call_id"] = derive_call_id(args_dict["agent_run_id"], tool_call_id)
@@ -633,6 +634,17 @@ def create_function_tool(
 
                 if _extra_args:
                     args_dict.update(_extra_args)
+
+                if pin_run_context:
+                    # N8: only this path can mint the token the Desktop handlers require, so
+                    # flows / procedures / direct API calls cannot reach them.
+                    from huf.ai.tools.desktop_workspace import issue_pin_token
+
+                    args_dict["_dx_pin"] = issue_pin_token(
+                        args_dict.get("agent_run_id"),
+                        args_dict.get("_dx_executor_id"),
+                        args_dict.get("_dx_user"),
+                    )
 
                 if "ignore_permissions" in args_dict:
                     del args_dict["ignore_permissions"]

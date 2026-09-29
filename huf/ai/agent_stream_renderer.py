@@ -15,6 +15,9 @@ from werkzeug.wrappers import Response
 
 from huf.ai.agent_integration import _has_queued_runs, _resolve_effective_model, run_agent_stream
 
+# Idle seconds after which the stream emits an SSE comment (keeps proxies from cutting it).
+SSE_KEEPALIVE_S = 15
+
 
 class AgentStreamRenderer(BaseRenderer):
 	"""Page renderer that handles SSE streaming for agents.
@@ -217,10 +220,23 @@ class AgentStreamRenderer(BaseRenderer):
 					desktop_executor_id=desktop_executor_id,
 				)
 				
-				# Convert async generator to sync
+				# Convert async generator to sync. While a chunk is pending (e.g. a Huf Desktop
+				# tool call waiting for approval) emit an SSE comment every SSE_KEEPALIVE_S so
+				# a proxy read timeout does not cut the stream. Clients ignore comment lines.
+				async def _next_chunk():
+					return await async_gen.__anext__()
+
 				while True:
 					try:
-						chunk = loop.run_until_complete(async_gen.__anext__())
+						pending_chunk = loop.create_task(_next_chunk())
+						while True:
+							done, _pending = loop.run_until_complete(
+								asyncio.wait({pending_chunk}, timeout=SSE_KEEPALIVE_S)
+							)
+							if done:
+								break
+							yield ": keep-alive\n\n"
+						chunk = pending_chunk.result()
 						yield f"data: {json.dumps(chunk)}\n\n"
 						
 						# Check if stream is complete

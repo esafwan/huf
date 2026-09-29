@@ -2736,6 +2736,35 @@ class _RunHeartbeat:
                 frappe.logger("huf").debug(f"Lock heartbeat renewal failed for {self.lock_key}: {exc!s}")
 
 
+def _begin_desktop_job_budget(conversation_id):
+    try:
+        from huf.ai.desktop_executor import begin_job_budget
+
+        begin_job_budget(conversation_id)
+    except Exception as exc:  # advisory accounting: never blocks the drain
+        frappe.logger("huf").debug(f"Desktop job budget start failed for {conversation_id}: {exc!s}")
+
+
+def _end_desktop_job_budget(conversation_id):
+    try:
+        from huf.ai.desktop_executor import end_job_budget
+
+        end_job_budget(conversation_id)
+    except Exception as exc:
+        frappe.logger("huf").debug(f"Desktop job budget end failed for {conversation_id}: {exc!s}")
+
+
+def _desktop_run_executed_mutations(run_id) -> bool:
+    """True if a run already sent a state-changing call to a Huf Desktop executor."""
+    try:
+        from huf.ai.desktop_executor import run_executed_mutations
+
+        return bool(run_executed_mutations(run_id))
+    except Exception as exc:
+        frappe.logger("huf").debug(f"Desktop ledger check failed for {run_id}: {exc!s}")
+        return False
+
+
 def _run_queued_agent(lock_attempt=0, **kwargs):
     """Background drainer for a single conversation.
 
@@ -2757,6 +2786,9 @@ def _run_queued_agent(lock_attempt=0, **kwargs):
         return
 
     last_result = None
+    # One RQ job (timeout _QUEUE_LOCK_TTL) drains every queued run of the conversation: the
+    # runs share one desktop wait budget so together they cannot reach the job timeout.
+    _begin_desktop_job_budget(conversation_id)
     try:
         while True:
             run_id = _next_queued_run(conversation_id)
@@ -2771,6 +2803,7 @@ def _run_queued_agent(lock_attempt=0, **kwargs):
         # Background queue drainer boundary: log full traceback.
         frappe.log_error(f"Conversation drainer failed: {frappe.get_traceback()}", "Huf")
     finally:
+        _end_desktop_job_budget(conversation_id)
         try:
             frappe.cache().delete(lock_key)
         except Exception as exc:
@@ -2793,6 +2826,14 @@ def _drain_run(run_doc, lock_key: str):
     try:
         context = frappe.parse_json(run_doc.runtime_context or "{}")
         execution_kwargs = _build_execution_kwargs(run_doc, context)
+        if isinstance(context, dict) and context.get("desktop"):
+            # A run executed again must not repeat desktop calls that already ran.
+            try:
+                from huf.ai.desktop_executor import begin_run_attempt
+
+                begin_run_attempt(run_doc.name)
+            except Exception as exc:
+                frappe.logger("huf").debug(f"Desktop run attempt start failed for {run_doc.name}: {exc!s}")
 
         prompt = execution_kwargs.get("prompt")
         if (
@@ -2926,7 +2967,19 @@ def recover_stalled_agent_runs():
             if ttl and ttl > 0:
                 continue
             for run in conversation_runs:
+                if _desktop_run_executed_mutations(run.name):
+                    # Re-running would repeat writes / commands already applied on the user's
+                    # machine (the model would re-issue them under new tool_call ids).
+                    _fail_queued_run(
+                        run.name,
+                        _(
+                            "Worker heartbeat lost after this run had already changed the desktop "
+                            "workspace; it was not re-run automatically. Send the request again."
+                        ),
+                    )
+                    continue
                 _reset_run_to_queued(run.name, _("Worker heartbeat lost; run recovered to queue."))
+            # Also wakes the drainer for runs queued behind a failed one (no-op when none).
             _enqueue_drain(conversation)
             drained_conversations.add(conversation)
 
