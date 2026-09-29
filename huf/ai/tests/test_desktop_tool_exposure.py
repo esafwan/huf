@@ -94,7 +94,10 @@ class TestDesktopToolExposure(unittest.TestCase):
 		for spec in DESKTOP_WORKSPACE_TOOLS:
 			name = frappe.db.get_value("Agent Tool Function", {"tool_name": spec["tool_name"]}, "name")
 			if not name:
-				props = {p["name"]: {k: v for k, v in p.items() if k != "name"} for p in spec["parameters"]}
+				props = {
+					p["fieldname"]: {"type": p["type"], "description": p.get("description", "")}
+					for p in spec["parameters"]
+				}
 				doc = frappe.get_doc(
 					{
 						"doctype": "Agent Tool Function",
