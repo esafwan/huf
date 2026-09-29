@@ -341,13 +341,14 @@ async def invoke_tool(
 	if not function_path:
 		return ToolResult(success=False, error=f"Cannot resolve handler for tool type '{tool_type}'")
 
-	if function_path.startswith("huf.ai.tools.desktop_workspace."):
-		# Desktop Workspace tools act on a user's machine and exist only inside a run that is
-		# pinned to a live desktop (sdk_tools mints the pin the handlers demand). A flow,
-		# procedure or scheduler node must never drive them with self-chosen ids.
+	if function_path.startswith("huf.ai.tools.desktop_"):
+		# Desktop tools (workspace, local skills, and every later desktop_* module) act on a
+		# user's machine and exist only inside a run that is pinned to a live desktop (sdk_tools
+		# mints the pin the handlers demand). A flow, procedure or scheduler node must never
+		# drive them with self-chosen ids.
 		return ToolResult(
 			success=False,
-			error="Desktop workspace tools are only available to an agent run pinned to Huf Desktop.",
+			error="Desktop tools are only available to an agent run pinned to Huf Desktop.",
 			denied=True,
 		)
 

@@ -1185,12 +1185,19 @@ def _desktop_runtime_context(desktop_ctx):
     """Persistable pin for ``runtime_context['desktop']`` (identifiers only, no secrets)."""
     if not desktop_ctx:
         return None
-    return {
+    pin = {
         "executor_id": desktop_ctx.get("executor_id"),
         "fingerprint": desktop_ctx.get("fingerprint"),
         "user": desktop_ctx.get("user"),
         "label": desktop_ctx.get("label"),
     }
+    # The local-capability catalog the lease published at send time: tools are built from
+    # this snapshot for the whole run (a later change only affects new runs).
+    if desktop_ctx.get("catalog_hash"):
+        pin["catalog_hash"] = desktop_ctx["catalog_hash"]
+    if desktop_ctx.get("origin"):
+        pin["origin"] = desktop_ctx["origin"]
+    return pin
 
 
 def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owner=None):
@@ -1226,7 +1233,14 @@ def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owne
         return None
     if not live or live.get("user") != run_owner:
         return None
-    return {**live, "fingerprint": pinned.get("fingerprint") or live.get("fingerprint")}
+    resolved = {**live, "fingerprint": pinned.get("fingerprint") or live.get("fingerprint")}
+    # The catalog is the PINNED one, never the lease's current one.
+    resolved.pop("catalog_hash", None)
+    if pinned.get("catalog_hash"):
+        resolved["catalog_hash"] = pinned["catalog_hash"]
+    if pinned.get("origin"):
+        resolved["origin"] = pinned["origin"]
+    return resolved
 
 
 def _with_desktop_status(result, status):

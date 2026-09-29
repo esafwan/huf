@@ -214,12 +214,20 @@ def _validate_executor_context(
 
 	# Canonical ctx for desktop_executor.dispatch: {executor_id, fingerprint, user, label}.
 	# The fingerprint is the one pinned on the run at send time (not the live one).
-	return {
+	ctx = {
 		"executor_id": pinned_executor_id,
 		"fingerprint": desktop_ctx.get("fingerprint") or _dx_fingerprint or None,
 		"user": run.owner,
 		"label": desktop_ctx.get("label"),
 	}
+	# The local-capability catalog pinned when the run started (server-owned: read from the
+	# persisted run, never from a tool argument).
+	if desktop_ctx.get("catalog_hash"):
+		ctx["catalog_hash"] = desktop_ctx["catalog_hash"]
+	# Origin, when the server recorded one on the run pin ("desktop" | "remote").
+	if desktop_ctx.get("origin"):
+		ctx["origin"] = desktop_ctx["origin"]
+	return ctx
 
 
 def _in_web_request() -> bool:

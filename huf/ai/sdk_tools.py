@@ -162,13 +162,88 @@ def _is_desktop_workspace_tool_doc(function_doc) -> bool:
     ).startswith("huf.ai.tools.desktop_workspace.")
 
 
-def _build_desktop_workspace_tools(function_docs, desktop_ctx) -> list:
-    """Build the attached Desktop Workspace tools for a run pinned to a live executor.
+def _desktop_tool_group(function_doc):
+    """Which desktop tool group an Agent Tool Function row belongs to, or None.
+
+    ``"workspace"`` and ``"skills"`` are built; ``"unknown"`` is a row whose handler lives in a
+    ``desktop_*`` module this server does not know how to expose (never built: fail closed).
+    """
+    from huf.ai.tools._registry import DESKTOP_LOCAL_SKILL_TOOL_NAMES
+
+    name = function_doc.tool_name or ""
+    path = function_doc.function_path or ""
+    if _is_desktop_workspace_tool_doc(function_doc):
+        return "workspace"
+    if name in DESKTOP_LOCAL_SKILL_TOOL_NAMES:
+        return "skills"
+    if path.startswith("huf.ai.tools.desktop_"):
+        return "unknown"
+    return None
+
+
+def _is_desktop_tool_doc(function_doc) -> bool:
+    """True for any row that may only be exposed to a run pinned to a live desktop."""
+    return _desktop_tool_group(function_doc) is not None
+
+
+# The desktop_skill_read description carries the catalog: at most this many entries and this
+# many characters (about 3k tokens), whichever comes first (PLAN 4.4).
+SKILL_CATALOG_MAX_ENTRIES = 40
+SKILL_CATALOG_MAX_CHARS = 12_000
+
+
+def _attached_server_skill_names(agent) -> set:
+    """Normalised names of the ACTIVE server skills attached to ``agent`` (server skills win)."""
+    from huf.ai.desktop_executor import normalize_catalog_name
+
+    names = set()
+    try:
+        for row in agent.get("agent_skill", []) or []:
+            skill_name, status = frappe.db.get_value("Skill", row.skill, ["skill_name", "status"]) or (None, None)
+            if skill_name and (status or "Active") == "Active":
+                names.add(normalize_catalog_name(skill_name))
+    except Exception as e:
+        frappe.logger("huf").debug(f"Could not read attached server skills: {e!s}")
+    names.discard("")
+    return names
+
+
+def _skill_read_description(base: str, visible: list) -> str:
+    """The base description plus the (capped, re-sanitised) local skill catalog."""
+    from huf.ai.desktop_executor import SKILL_DESCRIPTION_MAX_CHARS, sanitize_text
+
+    lines, used = [], 0
+    for entry in visible:
+        if len(lines) >= SKILL_CATALOG_MAX_ENTRIES:
+            break
+        line = f"- {entry['id']}: {sanitize_text(entry.get('description'), SKILL_DESCRIPTION_MAX_CHARS)}"
+        if entry.get("has_scripts"):
+            line += " [has scripts]"
+        if used + len(line) > SKILL_CATALOG_MAX_CHARS:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    out = [base, "", f"Skills the user enabled on their computer ({len(lines)} of {len(visible)} shown):"]
+    out.extend(lines)
+    if len(lines) < len(visible):
+        out.append(
+            f"{len(visible) - len(lines)} more skills are enabled: use desktop_skill_list to search them."
+        )
+    return "\n".join(out)
+
+
+def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
+    """Build the attached desktop tool groups for a run pinned to a live executor.
 
     Returns [] unless desktop_ctx carries an executor_id whose lease is live and
     owned by the ctx user (huf.ai.desktop_executor.resolve_desktop_ctx). The
     pinned _dx_* values come from the server-side lease, and overwrite anything
     the LLM passes (extra_args are applied after the LLM's args).
+
+    Groups (PLAN 4.3): ``workspace`` needs only the live lease. ``skills`` (local skills)
+    additionally needs, per tool, the lease capability (``skills.read`` / ``skills.exec``) and a
+    catalog PINNED to the run (``desktop_ctx['catalog_hash']``, never the lease's current one)
+    that names at least one enabled skill (one with scripts for ``desktop_skill_run``).
     """
     if not desktop_ctx or not isinstance(desktop_ctx, dict):
         return []
@@ -196,20 +271,42 @@ def _build_desktop_workspace_tools(function_docs, desktop_ctx) -> list:
         "_dx_user": live["user"],
     }
 
+    skills_state = None  # (capabilities, visible skills, hidden ids), computed on first use
     built = []
     seen = set()
     for function_doc in function_docs:
         if function_doc.tool_name in seen:
             continue
+        group = _desktop_tool_group(function_doc)
+        if group not in ("workspace", "skills"):
+            continue
+        description = function_doc.description
+        tool_extra = dict(extra_args)
+        if group == "skills":
+            if skills_state is None:
+                skills_state = _local_skills_state(desktop_ctx, executor_id, agent)
+            caps, visible, hidden = skills_state
+            from huf.ai.tools._registry import DESKTOP_LOCAL_SKILL_CAPABILITY
+
+            needed = DESKTOP_LOCAL_SKILL_CAPABILITY.get(function_doc.tool_name)
+            if not needed or needed not in caps or not visible:
+                continue
+            if function_doc.tool_name == "desktop_skill_run" and not any(
+                e.get("has_scripts") for e in visible
+            ):
+                continue
+            if function_doc.tool_name == "desktop_skill_read":
+                description = _skill_read_description(function_doc.description or "", visible)
+            tool_extra["_dx_hidden_skills"] = list(hidden)
         try:
             params = json.loads(function_doc.params) if function_doc.params else {}
             params.pop("additionalProperties", None)
             tool = create_function_tool(
                 function_doc.tool_name,
-                function_doc.description,
+                description,
                 function_doc.function_path,
                 params,
-                extra_args=dict(extra_args),
+                extra_args=tool_extra,
                 tool_type=function_doc.types,
                 blocking=True,
                 pin_run_context=True,
@@ -220,6 +317,29 @@ def _build_desktop_workspace_tools(function_docs, desktop_ctx) -> list:
         except Exception as e:
             frappe.logger("huf").debug(f"Error wiring desktop tool {function_doc.tool_name}: {e!s}")
     return built
+
+
+def _local_skills_state(desktop_ctx, executor_id, agent):
+    """``(lease capabilities, visible catalog skills, shadowed skill ids)`` for the skills group.
+
+    Empty visible list when no catalog is pinned, the pinned catalog expired, or every local
+    skill is shadowed by an attached server skill of the same name.
+    """
+    from huf.ai.desktop_executor import get_catalog, lease_capabilities
+
+    caps = lease_capabilities(executor_id)
+    catalog = get_catalog(executor_id, desktop_ctx.get("catalog_hash"))
+    if not catalog:
+        return caps, [], []
+    server_names = _attached_server_skill_names(agent) if agent is not None else set()
+    visible, hidden = [], []
+    for entry in catalog.get("skills") or []:
+        (hidden if entry.get("name") in server_names else visible).append(entry)
+    return caps, visible, [e["id"] for e in hidden]
+
+
+# Backwards-compatible name: the workspace group is the first group of ``_build_desktop_tools``.
+_build_desktop_workspace_tools = _build_desktop_tools
 
 
 def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None = None, **kwargs) -> list[FunctionTool]:
@@ -270,7 +390,7 @@ def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None =
     desktop_attached_docs = []
     for function_doc in allowed_tool_docs:
         try:
-            if _is_desktop_workspace_tool_doc(function_doc):
+            if _is_desktop_tool_doc(function_doc):
                 # Never built by the generic path: exposure is decided once,
                 # below, against the run's live desktop_ctx.
                 desktop_attached_docs.append(function_doc)
@@ -366,7 +486,7 @@ def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None =
             )
 
     if desktop_attached_docs:
-        tools.extend(_build_desktop_workspace_tools(desktop_attached_docs, desktop_ctx))
+        tools.extend(_build_desktop_tools(desktop_attached_docs, desktop_ctx, agent=agent))
 
     if lazy_enabled:
         # The discovery tools themselves are not something an agent author is
@@ -406,10 +526,10 @@ def create_agent_tools(agent, model_name: str = None, desktop_ctx: dict | None =
         skill_tools = load_all_skill_tools(agent, frappe.session.user)
         if skill_tools:
             # Skill-attached tools must not bypass the desktop ctx gate.
-            from huf.ai.tools._registry import DESKTOP_WORKSPACE_TOOL_NAMES
+            from huf.ai.tools._registry import DESKTOP_TOOL_NAMES
             tools.extend(
                 t for t in skill_tools
-                if getattr(t, "name", "") not in DESKTOP_WORKSPACE_TOOL_NAMES
+                if getattr(t, "name", "") not in DESKTOP_TOOL_NAMES
             )
     except Exception as e:
         frappe.log_error(
