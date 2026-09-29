@@ -267,13 +267,17 @@ class RemoteBase(unittest.TestCase):
 		self.assertEqual(errors, [])
 
 	def audit_rows(self, action, device_id=None):
+		previous = frappe.session.user
 		frappe.set_user("Administrator")
-		filters = {"action": action}
-		if device_id:
-			filters["device_id"] = device_id
-		return frappe.get_all(
-			"Desktop Remote Audit", filters=filters, fields=["name", "outcome", "user", "detail", "origin"]
-		)
+		try:
+			filters = {"action": action}
+			if device_id:
+				filters["device_id"] = device_id
+			return frappe.get_all(
+				"Desktop Remote Audit", filters=filters, fields=["name", "outcome", "user", "detail", "origin"]
+			)
+		finally:
+			frappe.set_user(previous)
 
 
 # --------------------------------------------------------------------------

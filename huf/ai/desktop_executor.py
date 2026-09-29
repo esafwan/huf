@@ -2066,8 +2066,12 @@ def dispatch(
 				),
 				"timeout_ms": timeout_ms,
 				"approval_timeout_ms": APPROVAL_TIMEOUT_MS,
-				"origin": ctx.get("origin") if ctx.get("origin") in ORIGINS else "desktop",
+				"origin": origin,
 			}
+			if policy:
+				request["agent_policy"] = policy
+			if lease.get("device_id"):
+				request["device_id"] = lease["device_id"]
 			if catalog_hash:
 				# The desktop answers ``tool_unavailable`` if it no longer has the skill or MCP
 				# tool this pinned catalog named; it never resolves the id to something else.
