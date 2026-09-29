@@ -2754,15 +2754,46 @@ def _end_desktop_job_budget(conversation_id):
         frappe.logger("huf").debug(f"Desktop job budget end failed for {conversation_id}: {exc!s}")
 
 
-def _desktop_run_executed_mutations(run_id) -> bool:
-    """True if a run already sent a state-changing call to a Huf Desktop executor."""
+def _desktop_run_requeue_block(run_id):
+    """Why a stale run must NOT be re-queued, or None when re-queueing is safe.
+
+    Only a run pinned to Huf Desktop is affected. Fails CLOSED: if the desktop ledger
+    cannot be read (Redis error) the run is treated as possibly changed and is not re-run.
+    """
+    try:
+        pinned = _run_is_desktop_pinned(run_id)
+    except Exception as exc:
+        frappe.logger("huf").warning(f"Could not read runtime context of {run_id}: {exc!s}")
+        return _(
+            "Worker heartbeat lost and the run could not be inspected; it was not re-run "
+            "automatically. Send the request again."
+        )
+    if not pinned:
+        return None
     try:
         from huf.ai.desktop_executor import run_executed_mutations
 
-        return bool(run_executed_mutations(run_id))
+        if run_executed_mutations(run_id):
+            return _(
+                "Worker heartbeat lost after this run had already changed the desktop "
+                "workspace; it was not re-run automatically. Send the request again."
+            )
     except Exception as exc:
-        frappe.logger("huf").debug(f"Desktop ledger check failed for {run_id}: {exc!s}")
+        frappe.logger("huf").warning(f"Desktop ledger check failed for {run_id}: {exc!s}")
+        return _(
+            "Worker heartbeat lost and the desktop call ledger could not be read, so it is unknown "
+            "whether this run already changed the desktop workspace; it was not re-run "
+            "automatically. Send the request again."
+        )
+    return None
+
+
+def _run_is_desktop_pinned(run_id) -> bool:
+    raw = frappe.db.get_value("Agent Run", run_id, "runtime_context")
+    if not raw:
         return False
+    ctx = raw if isinstance(raw, dict) else frappe.parse_json(raw)
+    return bool(isinstance(ctx, dict) and ctx.get("desktop"))
 
 
 def _run_queued_agent(lock_attempt=0, **kwargs):
@@ -2967,16 +2998,12 @@ def recover_stalled_agent_runs():
             if ttl and ttl > 0:
                 continue
             for run in conversation_runs:
-                if _desktop_run_executed_mutations(run.name):
+                block = _desktop_run_requeue_block(run.name)
+                if block:
                     # Re-running would repeat writes / commands already applied on the user's
-                    # machine (the model would re-issue them under new tool_call ids).
-                    _fail_queued_run(
-                        run.name,
-                        _(
-                            "Worker heartbeat lost after this run had already changed the desktop "
-                            "workspace; it was not re-run automatically. Send the request again."
-                        ),
-                    )
+                    # machine (the model would re-issue them under new tool_call ids), or we
+                    # cannot tell (fail closed).
+                    _fail_queued_run(run.name, block)
                     continue
                 _reset_run_to_queued(run.name, _("Worker heartbeat lost; run recovered to queue."))
             # Also wakes the drainer for runs queued behind a failed one (no-op when none).

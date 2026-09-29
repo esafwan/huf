@@ -262,8 +262,15 @@ class TestDesktopToolExposure(unittest.TestCase):
 		)
 		self.assertEqual(captured["agent_run_id"], "AR-real")
 		self.assertEqual(captured["conversation_id"], "CONV-real")
-		self.assertEqual(captured["call_id"], derive_call_id("AR-real", "call_abc123"))
+		# derived from the run + SDK tool_call_id plus a per-invocation nonce (N7)
+		self.assertTrue(captured["call_id"].startswith(derive_call_id("AR-real", "call_abc123") + ".n"))
 		self.assertNotIn("chosen", captured["call_id"])
+
+	def test_each_invocation_gets_its_own_nonce_in_the_call_id(self):
+		a = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-real"}, tool_call_id="0")
+		b = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-real"}, tool_call_id="0")
+		self.assertNotEqual(a["call_id"], b["call_id"])  # same run, same tool_call_id, two invocations
+		self.assertEqual(a["call_id"].rsplit(".n", 1)[0], b["call_id"].rsplit(".n", 1)[0])
 
 	def test_llm_run_identity_dropped_when_the_run_context_has_none(self):
 		captured = self._invoke_with_run_ctx(

@@ -81,13 +81,28 @@ as it waits, so the wait is bounded several ways:
   not, and rely on the 90 s cap.
 
 Idempotency and re-runs (N5, N7). Every call is recorded in a per-run ledger keyed by
-call_id with a hash of ``(op, canonical params)``. A provider that reuses tool_call ids
-("0", "call_1") with different params gets a fresh wire call id, never a stale cached
-result, and never the desktop's own call_id cache either. The ledger also lets the
-stale-run sweeper refuse to re-run a run that already changed the workspace
-(:func:`run_executed_mutations`); if such a run is executed again anyway,
-:func:`begin_run_attempt` snapshots the ledger and a repeated mutating call is answered
-from the recorded result instead of running again.
+wire call_id with a hash of ``(op, canonical params)``. There are two different kinds of
+"the same call again", handled by two different mechanisms:
+
+* Redelivery of the SAME INVOCATION (same process, same SDK tool invocation retried or
+  its waiter died): the wire call id is identical, so the final cache / stash / adoption
+  dedupe it. The id embeds a per-invocation nonce (:func:`mint_invocation_nonce`, minted
+  by ``sdk_tools`` each time the SDK starts a tool invocation), so it is only ever
+  reproduced inside that one invocation.
+* A NEW invocation that merely looks the same: a provider that reuses tool_call ids
+  ("0", "call_1") gets a different nonce, hence a different wire id, and never reads the
+  final cache, the ledger entry or the desktop's own call_id cache of an earlier
+  invocation, even with identical params (two ``npm test`` runs both execute). A reused
+  id carrying different params without a nonce (direct dispatch) is still re-keyed by
+  ``_sig_conflict``.
+* A crash re-run (worker killed, sweeper, queue redelivery) is a brand new invocation
+  with a new nonce, so it can NOT be recognised by call id. It is recognised by the
+  ledger keyed by run: the stale-run sweeper refuses to re-run a run that already
+  changed the workspace (:func:`run_executed_mutations`, fail closed on a Redis error);
+  if such a run is executed again anyway, :func:`begin_run_attempt` snapshots the
+  mutating entries and a repeated identical ``(op, params)`` call is answered from the
+  recorded result; while recorded calls remain unconsumed, any OTHER mutating call is
+  refused with ``already_dispatched`` because the workspace state is unknown.
 
 Threading. :func:`dispatch` runs in an ``asyncio.to_thread`` worker. It touches
 only Redis and ``publish_realtime``; it never reads the database and logs through
@@ -257,17 +272,32 @@ def _replay_key(agent_run_id):
 	return f"huf:dx:replay:{agent_run_id}"
 
 
-def derive_call_id(agent_run_id, tool_call_id):
-	"""Deterministic wire ``call_id`` for one SDK tool call of one run.
+def mint_invocation_nonce():
+	"""Fresh per-invocation nonce (12 hex chars). Minted once each time the SDK starts a
+	desktop tool invocation (``sdk_tools`` ``on_invoke_tool``), never reused."""
+	return uuid.uuid4().hex[:12]
 
-	The same (run, tool_call_id) always maps to the same id, so redeliveries and
-	retries dedupe; different runs never collide. Falls back to a hash when the
-	readable form would not fit the 200 char submit limit.
+
+def derive_call_id(agent_run_id, tool_call_id, nonce=None):
+	"""Deterministic wire ``call_id`` for one SDK tool invocation of one run.
+
+	The same (run, tool_call_id, nonce) always maps to the same id, so redeliveries of
+	the SAME invocation dedupe; different runs never collide. ``nonce`` (see
+	:func:`mint_invocation_nonce`) makes two separate invocations that a provider gave the
+	same tool_call_id ("0", "call_1") two different wire ids, so the second never reads the
+	first one's cached result. Falls back to a hash when the readable form would not fit
+	the 200 char submit limit.
 	"""
 	raw = f"{agent_run_id}:{tool_call_id}"
 	if len(raw) <= 120 and re.match(r"^[A-Za-z0-9_:.-]+$", raw):
-		return raw
-	return "h_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:48]
+		base = raw
+	else:
+		base = "h_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:48]
+	if nonce:
+		safe = re.sub(r"[^A-Za-z0-9]", "", str(nonce))[:24]
+		if safe:
+			return f"{base}.n{safe}"
+	return base
 
 
 def run_wait_budget_s():
@@ -947,10 +977,13 @@ def _ledger_put(agent_run_id, call_id, entry):
 		_log_failure("desktop_executor: ledger write failed")
 
 
-def _ledger_entries(key):
+def _ledger_entries(key, strict=False):
+	"""Entries of a ledger/replay hash. ``strict``: a Redis error raises instead of reading as empty."""
 	try:
 		raw = _raw_client().hgetall(_k(key)) or {}
 	except Exception:
+		if strict:
+			raise
 		return {}
 	out = {}
 	for field, value in raw.items():
@@ -984,10 +1017,12 @@ def _compact_final(final):
 
 def run_executed_mutations(agent_run_id):
 	"""True if this run already sent a state-changing call (write, edit, move, trash, exec) to a
-	desktop. The stale-run sweeper uses it to fail such a run instead of re-running it (N5)."""
+	desktop. The stale-run sweeper uses it to fail such a run instead of re-running it (N5).
+	Raises when Redis cannot be read: the caller must fail closed, not assume "nothing ran"."""
 	if not agent_run_id:
 		return False
-	return any(e.get("op") in MUTATING_OPS for e in _ledger_entries(_ledger_key(agent_run_id)).values())
+	entries = _ledger_entries(_ledger_key(agent_run_id), strict=True)
+	return any(e.get("op") in MUTATING_OPS for e in entries.values())
 
 
 def begin_run_attempt(agent_run_id):
@@ -1026,6 +1061,19 @@ def _replay_take(agent_run_id, op, sig):
 	except Exception:
 		_log_failure("desktop_executor: replay lookup failed")
 	return None
+
+
+def _replay_pending(agent_run_id, op):
+	"""True if this run is a re-run that still has recorded mutating calls it has not replayed.
+	Until they are consumed the workspace state is unknown, so a DIFFERENT mutating call must
+	not run. On a Redis error this fails closed (True): dispatch needs Redis anyway."""
+	if not agent_run_id or op not in MUTATING_OPS:
+		return False
+	try:
+		return bool(_ledger_entries(_replay_key(agent_run_id), strict=True))
+	except Exception:
+		_log_failure("desktop_executor: replay state unreadable")
+		return True
 
 
 def _sig_conflict(user, agent_run_id, call_id, sig):
@@ -1144,6 +1192,15 @@ def dispatch(
 				"already_dispatched",
 				"An earlier attempt of this run already sent this call to Huf Desktop and its result "
 				"was not recorded. Check the workspace state before repeating it.",
+			)
+		if _replay_pending(agent_run_id, op):
+			return _error(
+				op,
+				label,
+				"already_dispatched",
+				"An earlier attempt of this run already sent state-changing calls to Huf Desktop and "
+				"this call does not match any of them, so the workspace state is unknown. Nothing was "
+				"sent. Inspect the workspace with read-only calls before deciding what to change.",
 			)
 
 	# Size caps before anything is published.

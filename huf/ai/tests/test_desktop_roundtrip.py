@@ -447,6 +447,46 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.assertNotEqual(seen[1]["call_id"], self.call_id)  # the desktop cannot serve a stale one either
 		self.assertTrue(seen[1]["call_id"].startswith(self.call_id + "."))
 
+	def test_identical_params_under_a_reused_id_execute_per_invocation_but_a_redelivery_dedupes(self):
+		"""N7: a provider reusing tool_call_id "0" with IDENTICAL params in two invocations must run
+		both (no stale result); redelivering the SAME invocation (same nonce) must not run again."""
+		self.addCleanup(dx._delete, dx._ledger_key(self.run_name))
+		inv1 = dx.derive_call_id(self.run_name, "0", dx.mint_invocation_nonce())
+		inv2 = dx.derive_call_id(self.run_name, "0", dx.mint_invocation_nonce())
+		self.assertNotEqual(inv1, inv2)
+		thread, errors, seen, stop = self.answer_every_call(0.1)
+		try:
+			# each call is issued with a distinct nonce, like sdk_tools does per invocation
+			first = self.read_file(path="a.txt", call_id=inv1)
+			second = self.read_file(path="a.txt", call_id=inv2)
+			redelivered = self.read_file(path="a.txt", call_id=inv2)
+		finally:
+			stop.set()
+			thread.join(10)
+		self.assertEqual(errors, [])
+		self.assertTrue(first["ok"] and second["ok"])
+		self.assertEqual([r["call_id"] for r in seen], [inv1, inv2])  # two dispatches published
+		self.assertEqual(redelivered, second)  # same invocation: served from its own result, not sent
+
+	def test_sdk_invocations_with_the_same_tool_call_id_get_distinct_wire_ids(self):
+		import json as _json
+
+		from huf.ai import sdk_tools
+
+		ids = []
+		for _i in range(2):
+			args = {"path": "a.txt"}
+			sdk_tools._pin_run_identity(
+				args,
+				mock.Mock(context={"agent_run_id": self.run_name}, tool_call_id="0"),
+				dx.mint_invocation_nonce(),
+			)
+			ids.append(args.get("call_id"))
+		self.assertIsNotNone(ids[0])
+		self.assertNotEqual(ids[0], ids[1])
+		self.assertTrue(all(i.startswith(dx.derive_call_id(self.run_name, "0")) for i in ids))
+		_json.dumps(ids)
+
 	# ---- N8
 	def test_handlers_refuse_a_call_that_was_not_pinned_by_the_run(self):
 		with self.assertRaises(frappe.PermissionError):
@@ -597,6 +637,47 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.assertEqual(errors, [])
 		self.assertEqual(again, first)
 		self.assertEqual(len(seen), 1)
+
+	def test_sweeper_fails_closed_when_the_ledger_cannot_be_read_for_a_desktop_run(self):
+		desktop_run = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user))
+		plain_run = h.make_run(self.user, {})
+		self._docs.extend([("Agent Run", desktop_run), ("Agent Run", plain_run)])
+		frappe.set_user("Administrator")
+		for name in (desktop_run, plain_run):
+			self._backdate(name)
+		with mock.patch.object(dx, "_raw_client", side_effect=RuntimeError("redis down")), \
+				mock.patch.object(ai, "_enqueue_drain"):
+			ai.recover_stalled_agent_runs()
+		frappe.db.commit()
+		doc = frappe.db.get_value("Agent Run", desktop_run, ["status", "error_message"], as_dict=True)
+		self.assertEqual(doc.status, "Failed")  # NOT re-queued
+		self.assertIn("could not be read", doc.error_message)
+		# a run that is not pinned to a desktop is unaffected by the desktop ledger
+		self.assertEqual(frappe.db.get_value("Agent Run", plain_run, "status"), "Queued")
+
+	def test_rerun_refuses_a_different_mutating_call_while_recorded_ones_are_unreplayed(self):
+		self.addCleanup(dx._delete, dx._ledger_key(self.run_name), dx._replay_key(self.run_name))
+		thread, errors, seen, stop = self.answer_every_call(0.1)
+		try:
+			first = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-1", agent_run_id=self.run_name)
+			self.assertTrue(first["ok"])
+			self.assertEqual(dx.begin_run_attempt(self.run_name), 1)
+			# the re-run's model rephrases: different params, and the first write was already sent
+			diverged = dx.dispatch("fs.write", {"path": "a", "content": "y"}, self.ctx(), call_id="w-2", agent_run_id=self.run_name)
+			read = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="r-1", agent_run_id=self.run_name)
+			replay = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-3", agent_run_id=self.run_name)
+			after = dx.dispatch("fs.write", {"path": "b", "content": "z"}, self.ctx(), call_id="w-4", agent_run_id=self.run_name)
+		finally:
+			stop.set()
+			thread.join(10)
+		self.assertEqual(errors, [])
+		self.assertFalse(diverged["ok"])
+		self.assertEqual(diverged["error"]["code"], "already_dispatched")
+		self.assertIn("unknown", diverged["error"]["message"])
+		self.assertTrue(read["ok"])  # reads are never refused
+		self.assertEqual(replay, first)  # the identical call is answered from the record
+		self.assertTrue(after["ok"])  # caught up with the record: new work may proceed
+		self.assertEqual([r["op"] for r in seen], ["fs.write", "fs.read", "fs.write"])
 
 	# ---- N6
 	def test_parallel_calls_are_charged_by_wall_clock_once(self):

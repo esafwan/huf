@@ -87,7 +87,7 @@ def _merge_run_context(args_dict: dict, ctx) -> dict:
     return args_dict
 
 
-def _pin_run_identity(args_dict: dict, ctx) -> dict:
+def _pin_run_identity(args_dict: dict, ctx, nonce: str = None) -> dict:
     """Overwrite (never default) the run identity args from the server-side run context.
 
     Used by tools that must not trust the model for who/what run they act on
@@ -107,7 +107,7 @@ def _pin_run_identity(args_dict: dict, ctx) -> dict:
     args_dict.pop("_dx_pin", None)  # minted below by the caller, never taken from the model
     tool_call_id = getattr(ctx, "tool_call_id", None)
     if tool_call_id and args_dict.get("agent_run_id"):
-        args_dict["call_id"] = derive_call_id(args_dict["agent_run_id"], tool_call_id)
+        args_dict["call_id"] = derive_call_id(args_dict["agent_run_id"], tool_call_id, nonce)
     return args_dict
 
 
@@ -630,7 +630,11 @@ def create_function_tool(
 
                 _merge_run_context(args_dict, ctx)
                 if pin_run_context:
-                    _pin_run_identity(args_dict, ctx)
+                    # N7: one nonce per SDK invocation, so a provider reusing a tool_call_id
+                    # in a later invocation never reads this one's cached result.
+                    from huf.ai.desktop_executor import mint_invocation_nonce
+
+                    _pin_run_identity(args_dict, ctx, mint_invocation_nonce())
 
                 if _extra_args:
                     args_dict.update(_extra_args)
