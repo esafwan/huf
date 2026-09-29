@@ -530,7 +530,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.addCleanup(dx._delete, dx._budget_key(self.run_name))
 		cancels = []
 		real_cancel = dx._publish_cancel
-		with mock.patch.object(dx.frappe.conf, "get", side_effect=lambda k, d=None: 10 if k == "huf_desktop_web_budget_s" else d), \
+		with mock.patch.dict(frappe.conf, {"huf_desktop_web_budget_s": 10}), \
 				mock.patch.object(dw, "_in_web_request", return_value=True), \
 				mock.patch.object(dx, "_publish_cancel", side_effect=lambda *a: (cancels.append(a), real_cancel(*a))):
 			thread, errors, _ = self.play_desktop([(0.1, "ack", {})])  # acks, then the user never answers
