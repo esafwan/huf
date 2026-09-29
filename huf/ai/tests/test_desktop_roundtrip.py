@@ -659,14 +659,14 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.addCleanup(dx._delete, dx._ledger_key(self.run_name), dx._replay_key(self.run_name))
 		thread, errors, seen, stop = self.answer_every_call(0.1)
 		try:
-			first = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-1", agent_run_id=self.run_name)
+			first = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id=f"w-1-{self.call_id}", agent_run_id=self.run_name)
 			self.assertTrue(first["ok"], first)
 			self.assertEqual(dx.begin_run_attempt(self.run_name), 1)
 			# the re-run's model rephrases: different params, and the first write was already sent
-			diverged = dx.dispatch("fs.write", {"path": "a", "content": "y"}, self.ctx(), call_id="w-2", agent_run_id=self.run_name)
-			read = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="r-1", agent_run_id=self.run_name)
-			replay = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-3", agent_run_id=self.run_name)
-			after = dx.dispatch("fs.write", {"path": "b", "content": "z"}, self.ctx(), call_id="w-4", agent_run_id=self.run_name)
+			diverged = dx.dispatch("fs.write", {"path": "a", "content": "y"}, self.ctx(), call_id=f"w-2-{self.call_id}", agent_run_id=self.run_name)
+			read = dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id=f"r-1-{self.call_id}", agent_run_id=self.run_name)
+			replay = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id=f"w-3-{self.call_id}", agent_run_id=self.run_name)
+			after = dx.dispatch("fs.write", {"path": "b", "content": "z"}, self.ctx(), call_id=f"w-4-{self.call_id}", agent_run_id=self.run_name)
 		finally:
 			stop.set()
 			thread.join(10)
