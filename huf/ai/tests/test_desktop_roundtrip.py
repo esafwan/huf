@@ -660,7 +660,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		thread, errors, seen, stop = self.answer_every_call(0.1)
 		try:
 			first = dx.dispatch("fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="w-1", agent_run_id=self.run_name)
-			self.assertTrue(first["ok"])
+			self.assertTrue(first["ok"], first)
 			self.assertEqual(dx.begin_run_attempt(self.run_name), 1)
 			# the re-run's model rephrases: different params, and the first write was already sent
 			diverged = dx.dispatch("fs.write", {"path": "a", "content": "y"}, self.ctx(), call_id="w-2", agent_run_id=self.run_name)

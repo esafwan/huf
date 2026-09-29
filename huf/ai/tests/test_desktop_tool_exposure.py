@@ -284,8 +284,11 @@ class TestDesktopToolExposure(unittest.TestCase):
 		b = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-1"}, "call_x")
 		c = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-2"}, "call_x")
 		d = self._invoke_with_run_ctx({"path": "."}, {"agent_run_id": "AR-1"}, "call_y")
-		self.assertEqual(a["call_id"], b["call_id"])
-		self.assertEqual(len({a["call_id"], c["call_id"], d["call_id"]}), 3)
+		def base(x):  # the per-invocation nonce suffix is intentionally different (N7)
+			return x["call_id"].rsplit(".n", 1)[0]
+
+		self.assertEqual(base(a), base(b))
+		self.assertEqual(len({base(a), base(c), base(d)}), 3)
 
 	# N8: only the pinned-run path mints the token the handlers require
 	def test_pin_token_is_minted_for_the_pinned_run_and_a_model_supplied_one_is_discarded(self):
