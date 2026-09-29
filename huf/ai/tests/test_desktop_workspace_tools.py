@@ -183,19 +183,21 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 		self._original_user = frappe.session.user
 		frappe.set_user("Administrator")
 
-		# Create test Agent if not exists
-		if not frappe.db.exists("Agent", "test-agent-h4t"):
-			agent = frappe.get_doc({
-				"doctype": "Agent",
-				"name": "test-agent-h4t",
-				"agent_name": "test-agent-h4t",
-				"instructions": "Test agent for H4t tests",
-			})
-			agent.insert(ignore_permissions=True)
-
-		# Clean up any existing test run
+		# Clean up any existing test artifacts first
 		if frappe.db.exists("Agent Run", "test-run-h4t"):
 			frappe.delete_doc("Agent Run", "test-run-h4t", ignore_permissions=True, force=True)
+		if frappe.db.exists("Agent", "test-agent-h4t"):
+			frappe.delete_doc("Agent", "test-agent-h4t", ignore_permissions=True, force=True)
+
+		# Create test Agent
+		agent = frappe.get_doc({
+			"doctype": "Agent",
+			"name": "test-agent-h4t",
+			"agent_name": "test-agent-h4t",
+			"instructions": "Test agent for H4t tests",
+		})
+		agent.insert(ignore_permissions=True)
+		frappe.db.commit()
 
 		# Create a valid Agent Run with desktop context
 		self.run = frappe.get_doc({
@@ -214,6 +216,7 @@ class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 			},
 		})
 		self.run.insert(ignore_permissions=True)
+		frappe.db.commit()
 
 	def tearDown(self):
 		"""Clean up test data."""
