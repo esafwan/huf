@@ -224,9 +224,20 @@ def _validate_executor_context(
 	# persisted run, never from a tool argument).
 	if desktop_ctx.get("catalog_hash"):
 		ctx["catalog_hash"] = desktop_ctx["catalog_hash"]
-	# Origin, when the server recorded one on the run pin ("desktop" | "remote").
-	if desktop_ctx.get("origin"):
-		ctx["origin"] = desktop_ctx["origin"]
+	# Origin ("desktop" | "remote") and the agent's desktop policy are honoured only from a pin the
+	# server signed at run start. ``Agent Run.runtime_context`` is writable by a Huf User on insert,
+	# so an unsigned or altered pin is REMOTE with no policy (the dispatcher then needs remote control
+	# on for the desktop and the agent). ``device_id`` rides the same signature.
+	from huf.ai.desktop_executor import verify_pin
+
+	if verify_pin(desktop_ctx, run.get("conversation") or ""):
+		ctx["origin"] = desktop_ctx.get("origin") or "remote"
+		if desktop_ctx.get("agent_policy"):
+			ctx["agent_policy"] = desktop_ctx["agent_policy"]
+		if desktop_ctx.get("device_id"):
+			ctx["device_id"] = desktop_ctx["device_id"]
+	else:
+		ctx["origin"] = "remote"
 	return ctx
 
 

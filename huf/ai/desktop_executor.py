@@ -49,6 +49,19 @@ label}`` (the run's pinned desktop context). ``_dx_*`` keys are NOT accepted.
     huf:dx:job:<conversation_id>         value  id of the queue drain job currently holding the conversation
     huf:dx:ledger:<agent_run_id>         hash   call_id -> {sig, op, at, final} for every call a run sent
     huf:dx:replay:<agent_run_id>         hash   ledger snapshot taken when a run is executed again
+    huf:dx:device:<user>:<device_id>     value  executor id of the live lease of a registered device (TTL 60s)
+    huf:dx:devseen:<user>:<device_id>    value  epoch ms the device was last seen (TTL 30 days)
+    huf:dx:proof:<sha32>                 value  one-time flag: a device registration proof was already used (TTL 300s)
+
+Lease secret and device identity (Desktop Remote Sessions R1). ``register_desktop_executor``
+returns a per-lease ``lease_secret`` ONCE; only its SHA-256 is stored on the lease. The lease
+endpoints (heartbeat, unregister, catalog, list_pending, submit_desktop_tool_event) require it
+(``lease_secret`` argument or the ``X-Huf-Lease-Secret`` header, constant-time compare), so a web
+session of the same Frappe user, even one that knows the executor id, can neither read pending calls
+nor forge results. A desktop may also register a stable ``device_id`` (first 32 hex chars of
+SHA-256 over the raw Ed25519 public key) with the public key and a signed proof of possession;
+conversations bind to that public id, never to a credential. A run is desktop-ORIGIN only when the
+request that started it carried a valid lease secret; everything else is ``remote``.
 
 Identity. ``agent_run_id`` / ``conversation_id`` / ``call_id`` are pinned by the
 server (``sdk_tools.create_function_tool(pin_run_context=True)``): the LLM cannot
@@ -111,11 +124,14 @@ only Redis and ``publish_realtime``; it never reads the database and logs throug
 ``frappe.logger`` rather than ``frappe.log_error`` (which writes a DB row).
 """
 
+import base64
 import hashlib
+import hmac
 import json
 import math
 import pickle
 import re
+import secrets
 import threading
 import time
 import unicodedata
@@ -123,6 +139,8 @@ import uuid
 
 import frappe
 import redis
+
+from huf.ai import desktop_policy
 
 PROTOCOL_VERSION = 1
 
@@ -267,9 +285,26 @@ MCP_ANNOTATIONS_MAX_BYTES = 2 * 1024
 CATALOG_NAME_MAX = 48
 # Features the server advertises in the register response, so a newer desktop can tell an old
 # server (no ``features`` key) from one that understands the catalog.
-SERVER_FEATURES = {"catalog": CATALOG_VERSION, "skills": True, "proc": True, "mcp": True, "browser": True}
+SERVER_FEATURES = {
+	"catalog": CATALOG_VERSION,
+	"skills": True,
+	"proc": True,
+	"mcp": True,
+	"browser": True,
+	"device": True,
+	"control": True,
+	"lease_secret": True,
+}
 
 PERMISSION_MODES = frozenset({"full", "sandbox", "ask", "auto"})
+LEASE_SECRET_HEADER = "X-Huf-Lease-Secret"
+CONTROL_EVENT = "huf_desktop_control"
+CONTROL_SET_PERMISSION_MODE = "control.set_permission_mode"
+CONTROL_TIMEOUT_MS = 15_000
+DEVICE_SEEN_TTL_S = 30 * 24 * 60 * 60
+PROOF_TTL_S = 300
+PROOF_MAX_SKEW_S = 120
+DEVICE_LABEL_MAX = 64
 EVENT_KINDS = frozenset({"ack", "approval_pending", "result", "error"})
 TERMINAL_KINDS = frozenset({"result", "error"})
 DESKTOP_ERROR_CODES = frozenset(
@@ -301,6 +336,9 @@ _CATALOG_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _CATALOG_NAME_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
 _SKILL_ID_RE = re.compile(r"^local:[a-z0-9_-]{1,48}/[a-z0-9_-]{1,48}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-fA-F]{8,64}$")
+_DEVICE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# ASN.1 prefix of an Ed25519 SubjectPublicKeyInfo (Node's default export); the raw key follows.
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 # --------------------------------------------------------------------------
@@ -365,6 +403,18 @@ def _ledger_key(agent_run_id):
 
 def _replay_key(agent_run_id):
 	return f"huf:dx:replay:{agent_run_id}"
+
+
+def _device_key(user, device_id):
+	return f"huf:dx:device:{user}:{device_id}"
+
+
+def _devseen_key(user, device_id):
+	return f"huf:dx:devseen:{user}:{device_id}"
+
+
+def _proof_key(digest):
+	return f"huf:dx:proof:{digest}"
 
 
 def mint_invocation_nonce():
@@ -557,6 +607,183 @@ def _index_remove(user, executor_id):
 
 
 # --------------------------------------------------------------------------
+# Lease secret, device identity, origin (Desktop Remote Sessions R1)
+# --------------------------------------------------------------------------
+
+
+def _hash_secret(secret):
+	return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _mint_lease_secret():
+	"""A fresh per-lease secret. Returned to the desktop once; only its hash is stored."""
+	return secrets.token_urlsafe(32)
+
+
+def presented_secret(explicit=None):
+	"""The lease secret a request presents: the ``lease_secret`` argument, else the
+	``X-Huf-Lease-Secret`` header. Never raises."""
+	if isinstance(explicit, str) and explicit:
+		return explicit
+	try:
+		request = getattr(frappe.local, "request", None)
+		value = request.headers.get(LEASE_SECRET_HEADER) if request is not None else None
+	except Exception:
+		value = None
+	return value if isinstance(value, str) and value else None
+
+
+def secret_matches(lease, presented):
+	"""Constant-time check of a presented secret against the lease's stored hash. A lease without a
+	stored hash (created before secrets existed) matches nothing."""
+	stored = (lease or {}).get("secret_hash")
+	if not stored or not isinstance(presented, str) or not presented:
+		return False
+	return hmac.compare_digest(_hash_secret(presented).encode("ascii"), str(stored).encode("ascii"))
+
+
+def _require_secret(lease, lease_secret):
+	if not secret_matches(lease, presented_secret(lease_secret)):
+		raise frappe.PermissionError("A valid lease secret is required for this desktop executor.")
+
+
+def origin_for(executor_id, lease_secret=None, user=None):
+	"""``"desktop"`` only when the request presents the live lease's secret, else ``"remote"``.
+
+	Decided server-side and never from a client-supplied field: a web or mobile session of the same
+	Frappe user has the executor id (it is on the run pin) but never the secret.
+	"""
+	lease = _get_lease(executor_id) if executor_id else None
+	if not lease or (user and lease.get("user") != user):
+		return "remote"
+	return "desktop" if secret_matches(lease, presented_secret(lease_secret)) else "remote"
+
+
+def derive_device_id(raw_public_key):
+	"""Public device id: first 32 hex chars of SHA-256 over the raw 32-byte Ed25519 public key."""
+	return hashlib.sha256(raw_public_key).hexdigest()[:32]
+
+
+def _b64decode(value, what):
+	if not isinstance(value, str) or not value.strip():
+		raise frappe.ValidationError(f"{what} is required")
+	text = value.strip().replace("-", "+").replace("_", "/")
+	text += "=" * (-len(text) % 4)
+	try:
+		return base64.b64decode(text, validate=True)
+	except Exception:
+		raise frappe.ValidationError(f"{what} is not valid base64")
+
+
+def _decode_public_key(public_key):
+	raw = _b64decode(public_key, "public_key")
+	if len(raw) == 44 and raw.startswith(_ED25519_SPKI_PREFIX):
+		raw = raw[len(_ED25519_SPKI_PREFIX) :]
+	if len(raw) != 32:
+		raise frappe.ValidationError("public_key must be an Ed25519 key (raw 32 bytes or SPKI DER, base64)")
+	return raw
+
+
+def registration_proof_message(executor_id, device_id, ts):
+	"""What the desktop signs to prove it holds the private key of a device it registers."""
+	return f"huf-desktop-register:v1:{executor_id}:{device_id}:{int(ts)}".encode("utf-8")
+
+
+def _verify_device_proof(raw_key, executor_id, device_id, device_proof, proof_ts):
+	try:
+		ts = int(proof_ts)
+	except (TypeError, ValueError):
+		raise frappe.ValidationError("proof_ts is required with a device registration")
+	if abs(int(time.time()) - ts) > PROOF_MAX_SKEW_S:
+		raise frappe.PermissionError("device proof is outside the allowed clock skew")
+	signature = _b64decode(device_proof, "device_proof")
+	try:
+		from cryptography.exceptions import InvalidSignature
+		from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+		Ed25519PublicKey.from_public_bytes(raw_key).verify(
+			signature, registration_proof_message(executor_id, device_id, ts)
+		)
+	except InvalidSignature:
+		raise frappe.PermissionError("device proof is invalid")
+	except ImportError:
+		raise frappe.ValidationError("device identity is not available on this server")
+	digest = hashlib.sha256(signature).hexdigest()[:32]
+	try:
+		fresh = _raw_client().set(_k(_proof_key(digest)), 1, nx=True, ex=PROOF_TTL_S)
+	except Exception:
+		fresh = True  # advisory replay guard: the signature is bound to executor id and a 2 minute window
+	if not fresh:
+		raise frappe.PermissionError("device proof was already used")
+
+
+def _verify_device(executor_id, device_id, public_key, device_proof, proof_ts):
+	"""Validate an optional device identity. Returns ``{device_id, public_key}`` or None (a
+	legacy desktop that sends neither, which stays fully supported)."""
+	if not device_id and not public_key:
+		return None
+	raw = _decode_public_key(public_key)
+	derived = derive_device_id(raw)
+	if device_id and device_id != derived:
+		raise frappe.ValidationError("device_id does not match public_key")
+	_verify_device_proof(raw, executor_id, derived, device_proof, proof_ts)
+	return {"device_id": derived, "public_key": base64.b64encode(raw).decode("ascii")}
+
+
+def _device_bind(user, device_id, executor_id):
+	try:
+		_setex(_device_key(user, device_id), executor_id, LEASE_TTL_S)
+		_setex(_devseen_key(user, device_id), _now_ms(), DEVICE_SEEN_TTL_S)
+	except Exception:
+		_log_failure("desktop_executor: device index write failed")
+
+
+def _device_touch(lease):
+	if lease and lease.get("device_id"):
+		_device_bind(lease["user"], lease["device_id"], lease["executor_id"])
+
+
+def find_device_lease(user, device_id):
+	"""The live lease of ``user``'s device ``device_id``, or None. Never raises."""
+	if not user or not isinstance(device_id, str) or not _DEVICE_ID_RE.match(device_id):
+		return None
+	try:
+		executor_id = _get(_device_key(user, device_id))
+	except Exception:
+		return None
+	lease = _get_lease(executor_id) if isinstance(executor_id, str) else None
+	if lease and lease.get("user") == user and lease.get("device_id") == device_id:
+		return lease
+	return None
+
+
+def device_last_seen(user, device_id):
+	"""Epoch ms the device was last seen (register, heartbeat, unregister), or None."""
+	try:
+		value = _get(_devseen_key(user, device_id))
+	except Exception:
+		return None
+	return int(value) if isinstance(value, (int, float)) else None
+
+
+def known_device_ids(user):
+	"""Device ids of ``user`` whose lease is live or which were seen recently (from the user index
+	of live leases plus the seen markers). Live leases only: an offline device is known through the
+	conversations bound to it."""
+	out = []
+	try:
+		r = _raw_client()
+		for member in r.smembers(_k(_user_key(user))) or []:
+			member = member.decode() if isinstance(member, bytes) else member
+			lease = _get_lease(member)
+			if lease and lease.get("user") == user and lease.get("device_id"):
+				out.append(lease["device_id"])
+	except Exception:
+		pass
+	return sorted(set(out))
+
+
+# --------------------------------------------------------------------------
 # Lease API (desktop main process -> Huf, REST, API-key auth)
 # --------------------------------------------------------------------------
 
@@ -569,8 +796,30 @@ def register_desktop_executor(
 	platform=None,
 	workspace=None,
 	capabilities=None,
+	device_id=None,
+	public_key=None,
+	device_proof=None,
+	proof_ts=None,
+	device_label=None,
+	remote_control=False,
+	lease_secret=None,
 ):
-	"""Register (or re-register) a desktop executor lease for the session user."""
+	"""Register (or re-register) a desktop executor lease for the session user.
+
+	Additive fields (an older desktop that sends none of them keeps working, without a device):
+
+	* ``device_id`` / ``public_key`` / ``device_proof`` / ``proof_ts``: a stable device identity.
+	  ``public_key`` is an Ed25519 key (base64, raw or SPKI DER); ``device_id`` is derived from it
+	  (:func:`derive_device_id`) and, when sent, must match. ``device_proof`` is the base64 Ed25519
+	  signature of :func:`registration_proof_message`; it proves the desktop holds the private key.
+	* ``remote_control``: the desktop-side global switch. Remote-origin runs and remote
+	  permission-mode changes are refused unless it is true (default false).
+	* ``device_label``: a human label ("Safwan's MacBook") shown next to the workspace label.
+	* ``lease_secret``: required to re-register a LIVE lease of this executor id (or prove the same
+	  device key), so a web session that knows the executor id cannot take a live lease over.
+
+	The response carries ``lease_secret``: returned ONCE, held only by the desktop main process.
+	"""
 	user = _require_user()
 	executor_id = _validate_executor_id(executor_id)
 	try:
@@ -592,13 +841,40 @@ def register_desktop_executor(
 		raise frappe.ValidationError("capabilities must be a list")
 	caps = sorted({c for c in capabilities if c in VALID_CAPABILITIES})
 
+	device = _verify_device(executor_id, device_id, public_key, device_proof, proof_ts)
+
 	existing = _get_lease(executor_id)
 	if existing and existing.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
+	if existing and existing.get("secret_hash"):
+		same_key = bool(
+			device
+			and existing.get("public_key")
+			and hmac.compare_digest(str(existing["public_key"]), device["public_key"])
+		)
+		if not (secret_matches(existing, presented_secret(lease_secret)) or same_key):
+			raise frappe.PermissionError("Re-registering a live desktop executor requires its lease secret.")
+
+	if device:
+		# A relaunched desktop (new executor id, same device key) supersedes the old lease of the
+		# device at once instead of waiting for it to expire.
+		try:
+			previous = _get(_device_key(user, device["device_id"]))
+		except Exception:
+			previous = None
+		if isinstance(previous, str) and previous != executor_id:
+			old = _get_lease(previous)
+			if old and old.get("user") == user and old.get("device_id") == device["device_id"]:
+				try:
+					_delete(_lease_key(previous))
+				except Exception:
+					pass
+				_index_remove(user, previous)
 	if not existing:
 		_enforce_lease_cap(user)
 
 	now = _now_ms()
+	secret = _mint_lease_secret()
 	lease = {
 		"executor_id": executor_id,
 		"user": user,
@@ -610,24 +886,40 @@ def register_desktop_executor(
 		"registered_at": (existing or {}).get("registered_at") or now,
 		"last_heartbeat": now,
 		"socket_connected": True,
+		"secret_hash": _hash_secret(secret),
+		"remote_control": _to_bool(remote_control),
 	}
+	if device:
+		lease["device_id"] = device["device_id"]
+		lease["public_key"] = device["public_key"]
+		lease["device_label"] = sanitize_text(device_label, DEVICE_LABEL_MAX)
 	# A re-register (same launch) keeps the catalog the desktop already published.
 	if (existing or {}).get("catalog_hash"):
 		lease["catalog_hash"] = existing["catalog_hash"]
 	_put_lease(executor_id, lease)
 	_index_add(user, executor_id)
-	return {
+	_device_touch(lease)
+	out = {
 		"ok": True,
 		"lease_ttl_s": LEASE_TTL_S,
 		"heartbeat_s": HEARTBEAT_S,
 		"protocol_version": PROTOCOL_VERSION,
 		"features": dict(SERVER_FEATURES),
+		"lease_secret": secret,
 	}
+	if device:
+		out["device_id"] = device["device_id"]
+	return out
 
 
 @frappe.whitelist(methods=["POST"])
 def heartbeat_desktop_executor(
-	executor_id=None, workspace=None, socket_connected=True, catalog_hash=None
+	executor_id=None,
+	workspace=None,
+	socket_connected=True,
+	catalog_hash=None,
+	lease_secret=None,
+	remote_control=None,
 ):
 	"""Refresh the lease TTL. A missing lease answers ``reregister`` so the client re-registers.
 
@@ -636,6 +928,8 @@ def heartbeat_desktop_executor(
 	catalog (lease re-created, catalog expired, another desktop process published a different
 	one) the answer carries ``recatalog: true`` and the desktop publishes again. The catalog key
 	is refreshed together with the lease. A client that sends no hash is never asked to.
+
+	Requires the lease secret. ``remote_control`` (optional) updates the desktop-side global switch.
 	"""
 	user = _require_user()
 	executor_id = _validate_executor_id(executor_id)
@@ -644,6 +938,9 @@ def heartbeat_desktop_executor(
 		return {"ok": False, "reregister": True}
 	if lease.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
+	_require_secret(lease, lease_secret)
+	if remote_control is not None:
+		lease["remote_control"] = _to_bool(remote_control)
 
 	if workspace is not None:
 		lease["workspace"] = _clean_workspace(workspace)
@@ -666,6 +963,7 @@ def heartbeat_desktop_executor(
 
 	_put_lease(executor_id, lease)
 	_index_add(user, executor_id)
+	_device_touch(lease)
 	out = {"ok": True, "pending_call_ids": [r["call_id"] for r in _pending_requests(executor_id)]}
 	if recatalog:
 		out["recatalog"] = True
@@ -875,14 +1173,15 @@ def get_catalog(executor_id, catalog_hash):
 
 
 @frappe.whitelist(methods=["POST"])
-def register_desktop_catalog(executor_id=None, catalog=None):
+def register_desktop_catalog(executor_id=None, catalog=None, lease_secret=None):
 	"""Publish the desktop's local-capability catalog (enabled skills, later MCP tools, browser).
 
 	The catalog is sanitised, stored under ``huf:dx:catalog:<executor_id>:<sha16>`` and the
 	lease points at it, so a run started afterwards is pinned to that hash. Older hashes stay
 	readable until their TTL so a run that is already pinned keeps working. Rejects (raises) a
 	catalog over the caps; drops individual entries that are malformed and reports the count.
-	Answers ``reregister`` when the lease is gone, exactly like the heartbeat.
+	Answers ``reregister`` when the lease is gone, exactly like the heartbeat. Requires the lease
+	secret: a catalog names what the model may be told exists on the machine.
 	"""
 	user = _require_user()
 	executor_id = _validate_executor_id(executor_id)
@@ -891,6 +1190,7 @@ def register_desktop_catalog(executor_id=None, catalog=None):
 		return {"ok": False, "reregister": True}
 	if lease.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
+	_require_secret(lease, lease_secret)
 
 	clean, rejected = sanitize_catalog(catalog)
 	digest = catalog_hash_of(clean)
@@ -912,13 +1212,22 @@ def register_desktop_catalog(executor_id=None, catalog=None):
 
 
 @frappe.whitelist(methods=["POST"])
-def unregister_desktop_executor(executor_id=None):
-	"""Drop the lease (quit, workspace switch). Idempotent."""
+def unregister_desktop_executor(executor_id=None, lease_secret=None):
+	"""Drop the lease (quit, workspace switch). Idempotent. Requires the lease secret when a lease
+	exists: a web session must not be able to knock a desktop offline."""
 	user = _require_user()
 	executor_id = _validate_executor_id(executor_id)
 	lease = _get_lease(executor_id)
 	if lease and lease.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
+	if lease:
+		_require_secret(lease, lease_secret)
+		if lease.get("device_id"):
+			try:
+				_setex(_devseen_key(user, lease["device_id"]), _now_ms(), DEVICE_SEEN_TTL_S)
+				_delete(_device_key(user, lease["device_id"]))
+			except Exception:
+				pass
 	try:
 		_delete(_lease_key(executor_id))
 	except Exception:
@@ -928,8 +1237,10 @@ def unregister_desktop_executor(executor_id=None):
 
 
 @frappe.whitelist(methods=["POST", "GET"])
-def list_pending_desktop_tool_calls(executor_id=None):
-	"""Poll fallback: full request payloads for unexpired, not-yet-terminal calls."""
+def list_pending_desktop_tool_calls(executor_id=None, lease_secret=None):
+	"""Poll fallback: full request payloads for unexpired, not-yet-terminal calls (tool calls and
+	control requests, told apart by ``kind``). Requires the lease secret: a call carries file
+	paths, commands and content."""
 	user = _require_user()
 	executor_id = _validate_executor_id(executor_id)
 	lease = _get_lease(executor_id)
@@ -937,6 +1248,7 @@ def list_pending_desktop_tool_calls(executor_id=None):
 		return []
 	if lease.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
+	_require_secret(lease, lease_secret)
 	return _pending_requests(executor_id)
 
 
@@ -982,6 +1294,8 @@ def resolve_desktop_ctx(executor_id, user=None):
 		# The catalog the lease publishes right now; a run pins THIS value at send time.
 		if lease.get("catalog_hash"):
 			ctx["catalog_hash"] = lease["catalog_hash"]
+		if lease.get("device_id"):
+			ctx["device_id"] = lease["device_id"]
 		return ctx
 	except Exception:
 		return None
@@ -991,6 +1305,12 @@ def lease_capabilities(executor_id):
 	"""Capabilities of a live lease as a set (empty when the lease is gone or the cache is down)."""
 	lease = _get_lease(executor_id) if executor_id else None
 	return set((lease or {}).get("capabilities") or [])
+
+
+def lease_remote_control(executor_id):
+	"""True when the live lease reports the desktop-side remote-control switch on."""
+	lease = _get_lease(executor_id) if executor_id else None
+	return bool((lease or {}).get("remote_control"))
 
 
 def is_lease_live(executor_id):
@@ -1004,12 +1324,14 @@ def is_lease_live(executor_id):
 
 
 @frappe.whitelist(methods=["POST"])
-def submit_desktop_tool_event(call_id=None, executor_id=None, kind=None, payload=None):
+def submit_desktop_tool_event(call_id=None, executor_id=None, kind=None, payload=None, lease_secret=None):
 	"""Receive ``ack | approval_pending | result | error`` for a call.
 
 	Authorization, all required: session user == the user bound to the call,
-	``executor_id`` matches the call's executor, and the request stash still
-	exists. Only the first terminal event (result/error) is kept.
+	``executor_id`` matches the call's executor, the request stash still
+	exists, and the request presents the executor's LEASE SECRET (a web session of the same
+	user does not have it, so it cannot forge a result). Only the first terminal event
+	(result/error) is kept.
 	"""
 	user = _require_user()
 	if not isinstance(call_id, str) or not call_id or len(call_id) > 200:
@@ -1033,6 +1355,10 @@ def submit_desktop_tool_event(call_id=None, executor_id=None, kind=None, payload
 		raise frappe.PermissionError("Not permitted to submit an event for this call.")
 	if stash.get("executor_id") != executor_id:
 		raise frappe.PermissionError("executor_id does not match this call.")
+	lease = _get_lease(executor_id)
+	if not lease or lease.get("user") != user:
+		return {"status": "expired", "message": "This tool call has expired or is unknown."}
+	_require_secret(lease, lease_secret)
 
 	ttl = HARD_CAP_S + STASH_TTL_GRACE_S
 	if kind not in TERMINAL_KINDS:
@@ -1503,7 +1829,9 @@ def dispatch(
 	a web request the desktop wait budget of ``web_wait_budget_s`` ran out; a call still running was
 	cancelled), ``already_dispatched`` (an earlier attempt of the run sent this call and no result
 	was kept), ``capability_unavailable``, ``duplicate_in_flight``,
-	``permission_denied``, ``cache_unavailable``.
+	``permission_denied``, ``cache_unavailable``, ``remote_disabled`` (a remote-origin run while the
+	desktop's remote-control switch or the agent's ``allow_remote_desktop`` is off), ``denied_by_policy``
+	(the agent's desktop access policy switches the op's capability off).
 
 	``ctx`` is the pinned run context ``{executor_id, fingerprint, user, label}``.
 	Idempotent by ``(user, agent_run_id, call_id)`` AND the hash of ``(op, params)``: a repeat
@@ -1611,6 +1939,27 @@ def dispatch(
 	if OP_CAPABILITY[op] not in (lease.get("capabilities") or []):
 		return _error(
 			op, label, "capability_unavailable", f"The desktop executor does not support '{op}'."
+		)
+	origin = ctx.get("origin") if ctx.get("origin") in ORIGINS else "desktop"
+	policy = desktop_policy.sanitize_policy(ctx.get("agent_policy"))
+	if origin == "remote":
+		# Same user on both sides: when remote control is enabled (desktop switch AND the agent's
+		# flag) a remote run is not capped or prompted any further. Either off refuses it.
+		if not lease.get("remote_control"):
+			return _error(
+				op, label, "remote_disabled", "Remote control is turned off on this desktop."
+			)
+		if not (policy and policy.get(desktop_policy.REMOTE_FIELD)):
+			return _error(
+				op, label, "remote_disabled", "This agent does not allow remote desktop control."
+			)
+	needed = desktop_policy.op_capability(op, params)
+	if policy and needed and desktop_policy.level_of(policy, needed) == "off":
+		return _error(
+			op,
+			label,
+			"denied_by_policy",
+			f"This agent's desktop access policy switches '{needed}' off.",
 		)
 	catalog_hash = None
 	if op in SKILL_OPS:
@@ -1945,3 +2294,113 @@ def _wait(
 				phase_end += (APPROVAL_TIMEOUT_MS + APPROVAL_EXTENSION_GRACE_MS) / 1000.0
 		elif kind in TERMINAL_KINDS:
 			return _shape_terminal(op, label, kind, payload, int((now - started) * 1000))
+
+
+# --------------------------------------------------------------------------
+# Signed run pin (origin and policy cannot be forged through the Agent Run doc)
+# --------------------------------------------------------------------------
+
+PIN_SIGNED_FIELDS = (
+	"executor_id",
+	"fingerprint",
+	"user",
+	"label",
+	"catalog_hash",
+	"origin",
+	"device_id",
+	"agent_policy",
+)
+
+
+def _pin_key():
+	from frappe.utils.password import get_encryption_key
+
+	return hashlib.sha256(("huf-dx-pin-v1:" + str(get_encryption_key())).encode("utf-8")).digest()
+
+
+def _pin_message(pin, conversation_id):
+	body = {field: (pin or {}).get(field) for field in PIN_SIGNED_FIELDS}
+	body["conversation"] = conversation_id or ""
+	return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
+def sign_pin(pin, conversation_id=None):
+	"""HMAC over the security-relevant fields of a run's desktop pin and its conversation, keyed by
+	the site encryption key. ``Agent Run.runtime_context`` is writable by a Huf User on insert, so the
+	worker trusts ``origin`` and ``agent_policy`` from a pin only when this signature verifies."""
+	return hmac.new(_pin_key(), _pin_message(pin, conversation_id), hashlib.sha256).hexdigest()
+
+
+def verify_pin(pin, conversation_id=None):
+	sig = (pin or {}).get("sig")
+	if not isinstance(sig, str) or not sig:
+		return False
+	try:
+		return hmac.compare_digest(sig, sign_pin(pin, conversation_id))
+	except Exception:
+		return False
+
+
+# --------------------------------------------------------------------------
+# Control requests (server -> desktop settings, on the same lease and channel)
+# --------------------------------------------------------------------------
+
+
+def dispatch_control(lease, control_op, params, timeout_ms=CONTROL_TIMEOUT_MS):
+	"""Send one control request (for example ``control.set_permission_mode``) to the desktop that
+	holds ``lease`` and wait for its answer. Same channel as tool calls: stash, pending zset, the
+	desktop's ``submit_desktop_tool_event`` (secret-gated) with a ``result`` or ``error``; the wait
+	polls in ``POLL_SLICE_S`` slices. Returns ``{ok, data | error{code, message}}``; never raises for
+	expected failures.
+	"""
+	executor_id = lease.get("executor_id")
+	user = lease.get("user")
+	call_id = "ctl_" + uuid.uuid4().hex
+	issued_at = _now_ms()
+	request = {
+		"v": PROTOCOL_VERSION,
+		"kind": "control",
+		"call_id": call_id,
+		"executor_id": executor_id,
+		"op": control_op,
+		"params": params,
+		"issued_at": issued_at,
+		"ack_deadline_at": issued_at + ACK_TIMEOUT_S * 1000,
+		"deadline_at": issued_at + ACK_TIMEOUT_S * 1000 + int(timeout_ms),
+		"timeout_ms": int(timeout_ms),
+		"origin": "remote",
+	}
+	ttl = HARD_CAP_S + STASH_TTL_GRACE_S
+	try:
+		_setex(_request_key(call_id), {"user": user, "executor_id": executor_id, "request": request}, ttl)
+		r = _raw_client()
+		r.zadd(_k(_pending_key(executor_id)), {call_id: request["deadline_at"]})
+		r.expire(_k(_pending_key(executor_id)), ttl)
+	except Exception:
+		_log_failure("desktop_executor: control stash failed")
+		return {"ok": False, "error": {"code": "cache_unavailable", "message": "Could not reach the desktop."}}
+	try:
+		frappe.publish_realtime(event=CONTROL_EVENT, message=request, user=user)
+	except Exception:
+		_log_failure("desktop_executor: control publish failed")
+	started = _monotonic()
+	try:
+		final = _wait(
+			control_op,
+			None,
+			call_id,
+			executor_id,
+			user,
+			int(timeout_ms),
+			started,
+			hard_cap_s=ACK_TIMEOUT_S + int(timeout_ms) / 1000.0,
+		)
+	finally:
+		try:
+			_delete(_request_key(call_id), _result_key(call_id))
+			_raw_client().zrem(_k(_pending_key(executor_id)), call_id)
+		except Exception:
+			pass
+	if final.get("ok"):
+		return {"ok": True, "data": final.get("data")}
+	return {"ok": False, "error": final.get("error") or {"code": "internal", "message": "Control request failed."}}

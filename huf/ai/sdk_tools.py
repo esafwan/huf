@@ -283,6 +283,14 @@ def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
         "_dx_user": live["user"],
     }
 
+    # The agent's desktop access ceiling: a capability that is ``off`` removes its tools from the
+    # model's list. The pinned (signed) policy wins; an unpinned ctx reads it from the agent.
+    from huf.ai import desktop_policy
+
+    policy = desktop_policy.sanitize_policy(desktop_ctx.get("agent_policy"))
+    if policy is None:
+        policy = desktop_policy.policy_from_agent(agent)
+
     skills_state = None  # (capabilities, visible skills, hidden ids), computed on first use
     lease_caps = None
     built = []
@@ -290,6 +298,8 @@ def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
     mcp_docs = []
     for function_doc in function_docs:
         if function_doc.tool_name in seen:
+            continue
+        if not desktop_policy.tool_allowed(policy, function_doc.tool_name):
             continue
         group = _desktop_tool_group(function_doc)
         if group == "mcp":
@@ -342,7 +352,9 @@ def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
         except Exception as e:
             frappe.logger("huf").debug(f"Error wiring desktop tool {function_doc.tool_name}: {e!s}")
     if mcp_docs:
-        built.extend(_build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args, seen))
+        built.extend(
+            _build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args, seen, policy=policy)
+        )
     return built
 
 
@@ -366,7 +378,7 @@ def _spec_parameters_schema(spec) -> dict:
     return schema
 
 
-def _build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args, seen) -> list:
+def _build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args, seen, policy=None) -> list:
     """The local MCP and browser groups (PLAN 4.3, 4.4, 4.8).
 
     ``desktop_local_mcp`` expands to ``lmcp__<server>__<tool>`` tools within the eager budget and,
@@ -391,7 +403,9 @@ def _build_local_mcp_tools(mcp_docs, desktop_ctx, executor_id, agent, extra_args
     built = []
 
     def allowed(name):
-        return set(DESKTOP_LOCAL_MCP_CAPABILITY[name]) <= caps
+        from huf.ai import desktop_policy
+
+        return set(DESKTOP_LOCAL_MCP_CAPABILITY[name]) <= caps and desktop_policy.tool_allowed(policy, name)
 
     def add(tool):
         if tool and tool.name not in seen:

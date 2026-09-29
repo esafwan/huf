@@ -166,6 +166,7 @@ class AgentStreamRenderer(BaseRenderer):
 		skip_user_message = bool(_get_param("skip_user_message", False))
 		project = _get_param("project")
 		desktop_executor_id = _get_param("desktop_executor_id")
+		desktop_lease_secret = _get_param("desktop_lease_secret")
 		files = body.get("files")
 
 		create_new = bool(create_new)
@@ -218,6 +219,7 @@ class AgentStreamRenderer(BaseRenderer):
 					files=files,
 					project=project,
 					desktop_executor_id=desktop_executor_id,
+					desktop_lease_secret=desktop_lease_secret,
 				)
 				
 				# Convert async generator to sync. While a chunk is pending (e.g. a Huf Desktop

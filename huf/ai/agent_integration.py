@@ -1156,20 +1156,38 @@ def _link_preexisting_user_message(conversation_name: str, run_name: str):
 		frappe.db.set_value("Agent Message", msg_name, "agent_run", run_name, update_modified=False)
 
 
-def _resolve_desktop_request(desktop_executor_id):
-    """Resolve an optional ``desktop_executor_id`` once, at run start.
+def _resolve_desktop_request(desktop_executor_id, desktop_lease_secret=None, agent_doc=None):
+    """Resolve an optional ``desktop_executor_id`` once, at run start (a conversation that is NOT
+    desktop-hosted; see :func:`_resolve_desktop_for_run` for the hosted case).
 
     Returns ``(desktop_ctx, desktop_tools_status)``. Both are ``None`` when no
     id was supplied (the web/PWA never sends one), so callers see zero change.
     An id that is not a live lease owned by the session user is ignored with a
     warning; it never raises, so it cannot break the chat.
+
+    The ctx carries ``origin``: ``desktop`` only when the request presented the lease secret, else
+    ``remote``. A remote request needs the desktop's remote-control switch and the agent's
+    ``allow_remote_desktop`` flag, otherwise the run proceeds WITHOUT desktop tools
+    (``reason: remote_disabled``). ``agent_policy`` is the agent's effective desktop policy.
     """
     if not desktop_executor_id:
         return None, None
     try:
-        from huf.ai.desktop_executor import resolve_desktop_ctx
+        from huf.ai import desktop_policy, desktop_sessions
+        from huf.ai.desktop_executor import lease_remote_control, origin_for, resolve_desktop_ctx
 
         ctx = resolve_desktop_ctx(desktop_executor_id, user=frappe.session.user)
+        if ctx:
+            origin = origin_for(desktop_executor_id, desktop_lease_secret, user=frappe.session.user)
+            policy = desktop_policy.policy_from_agent(agent_doc)
+            ctx = {**ctx, "origin": origin, "agent_policy": policy}
+            if origin == "remote":
+                gate = desktop_sessions.remote_gate(
+                    {"remote_control": lease_remote_control(desktop_executor_id)}, policy
+                )
+                if gate:
+                    frappe.logger("huf").warning(f"Ignoring desktop_executor_id: remote control off ({gate})")
+                    return None, {"available": False, "reason": "remote_disabled"}
     except Exception as exc:  # never break the chat over an optional feature
         frappe.logger("huf").warning(f"desktop executor resolution failed: {exc!s}")
         ctx = None
@@ -1181,10 +1199,32 @@ def _resolve_desktop_request(desktop_executor_id):
     return ctx, {"available": True, "reason": None}
 
 
-def _desktop_runtime_context(desktop_ctx):
-    """Persistable pin for ``runtime_context['desktop']`` (identifiers only, no secrets)."""
+def _resolve_desktop_for_run(agent_doc, conversation, desktop_executor_id, desktop_lease_secret):
+    """``(desktop_ctx, desktop_status, error)`` for a run.
+
+    A desktop-hosted conversation always pins to its own device, from any client (a client-supplied
+    ``desktop_executor_id`` is ignored): an offline device, a changed workspace or a disabled remote
+    control gives a structured ``error`` and NEVER a server-side run. Any other conversation uses
+    the optional ``desktop_executor_id`` exactly as before.
+    """
+    from huf.ai import desktop_sessions
+
+    if desktop_sessions.is_hosted(conversation):
+        return desktop_sessions.resolve_hosted_run(conversation, agent_doc, desktop_lease_secret)
+    ctx, status = _resolve_desktop_request(desktop_executor_id, desktop_lease_secret, agent_doc)
+    return ctx, status, None
+
+
+def _desktop_runtime_context(desktop_ctx, conversation_id=None):
+    """Persistable pin for ``runtime_context['desktop']`` (identifiers only, no secrets).
+
+    ``origin``, ``device_id`` and ``agent_policy`` are covered by ``sig``: ``runtime_context`` is
+    writable by a Huf User on insert, so the worker honours them only from a verified pin.
+    """
     if not desktop_ctx:
         return None
+    from huf.ai.desktop_executor import sign_pin
+
     pin = {
         "executor_id": desktop_ctx.get("executor_id"),
         "fingerprint": desktop_ctx.get("fingerprint"),
@@ -1197,10 +1237,15 @@ def _desktop_runtime_context(desktop_ctx):
         pin["catalog_hash"] = desktop_ctx["catalog_hash"]
     if desktop_ctx.get("origin"):
         pin["origin"] = desktop_ctx["origin"]
+    if desktop_ctx.get("device_id"):
+        pin["device_id"] = desktop_ctx["device_id"]
+    if desktop_ctx.get("agent_policy"):
+        pin["agent_policy"] = desktop_ctx["agent_policy"]
+    pin["sig"] = sign_pin(pin, conversation_id)
     return pin
 
 
-def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owner=None):
+def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owner=None, conversation_id=None):
     """Re-resolve a pinned desktop ctx in the worker.
 
     The identity comes from the run OWNER, never from the session user (a queued run
@@ -1238,8 +1283,25 @@ def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owne
     resolved.pop("catalog_hash", None)
     if pinned.get("catalog_hash"):
         resolved["catalog_hash"] = pinned["catalog_hash"]
-    if pinned.get("origin"):
-        resolved["origin"] = pinned["origin"]
+    # Origin and the agent policy are honoured only from a pin the server signed. An unsigned or
+    # altered pin (a forged Agent Run) is treated as REMOTE with no policy, which the dispatcher
+    # refuses unless remote control is on for the desktop and the agent.
+    try:
+        from huf.ai.desktop_executor import verify_pin
+
+        signed = verify_pin(pinned, conversation_id)
+    except Exception:
+        signed = False
+    if signed:
+        resolved["origin"] = pinned.get("origin") or "remote"
+        if pinned.get("agent_policy"):
+            resolved["agent_policy"] = pinned["agent_policy"]
+        if pinned.get("device_id") and live.get("device_id") != pinned["device_id"]:
+            frappe.logger("huf").warning("Dropping desktop pin: the executor now belongs to another device")
+            return None
+    else:
+        resolved["origin"] = "remote"
+        resolved.pop("agent_policy", None)
     return resolved
 
 
@@ -1276,8 +1338,15 @@ def run_agent_sync(
     project: str = None,
     client_idempotency_key: str = None,
     desktop_executor_id: str = None,
+    desktop_lease_secret: str = None,
 ):
     """Run an agent synchronously (queue-first by default; see ``now``).
+
+    ``desktop_lease_secret`` (or the ``X-Huf-Lease-Secret`` header) is presented only by Huf
+    Desktop: it makes the run desktop-origin. Without it a run pinned to a desktop is
+    remote-origin. A desktop-hosted conversation always pins to its own device; when that cannot be
+    done a structured error dict (``desktop_offline``, ``workspace_changed``, ``remote_disabled``,
+    ``permission_denied``) is returned and nothing is created.
 
     ``allow_guest=True`` is intentional (Track-Item: ST-R4.3) — Agent has a
     per-agent ``allow_guest`` flag that is a deliberate, supported product
@@ -1410,7 +1479,11 @@ def run_agent_sync(
 
     sequence = _next_run_sequence(conversation.name)
 
-    desktop_ctx, desktop_status = _resolve_desktop_request(desktop_executor_id)
+    desktop_ctx, desktop_status, desktop_error = _resolve_desktop_for_run(
+        agent_doc, conversation, desktop_executor_id, desktop_lease_secret
+    )
+    if desktop_error:
+        return desktop_error
 
     runtime_context = {
         "channel_id": channel_id,
@@ -1426,7 +1499,7 @@ def run_agent_sync(
         "skip_user_message": skip_user_message,
     }
     if desktop_ctx:
-        runtime_context["desktop"] = _desktop_runtime_context(desktop_ctx)
+        runtime_context["desktop"] = _desktop_runtime_context(desktop_ctx, conversation.name)
 
     run_doc_data = {
         "doctype": "Agent Run",
@@ -1807,6 +1880,11 @@ def _execute_agent_run(
         external_id=external_id
     )
     conversation = frappe.get_doc("Agent Conversation", conversation_id)
+    # A desktop-hosted conversation never runs without a live pin to its own device (a queued run
+    # drained after the desktop went offline fails here instead of running on the server).
+    from huf.ai import desktop_sessions
+
+    desktop_sessions.assert_hosted_pin(conversation, desktop_ctx)
     run_doc = frappe.get_doc("Agent Run", run_id)
 
     # Reconstruct and cache the budget (ST-09.2)
@@ -2962,6 +3040,7 @@ def _build_execution_kwargs(run_doc, context: dict):
             context,
             run_owner=getattr(run_doc, "owner", None),
             conversation_owner=_conversation_owner(getattr(run_doc, "conversation", None)),
+            conversation_id=getattr(run_doc, "conversation", None),
         ),
     }
 
@@ -3070,6 +3149,7 @@ async def run_agent_stream(
     project: str = None,
     client_idempotency_key: str = None,
     desktop_executor_id: str = None,
+    desktop_lease_secret: str = None,
 ):
     """
     Streaming version of run_agent_sync.
@@ -3261,10 +3341,17 @@ async def run_agent_stream(
 
         # Resolve the optional desktop executor once at run start and pin it on
         # the run (tool handlers verify the run's pinned executor).
-        desktop_ctx, desktop_status = _resolve_desktop_request(desktop_executor_id)
+        desktop_ctx, desktop_status, desktop_error = _resolve_desktop_for_run(
+            agent_doc, conversation, desktop_executor_id, desktop_lease_secret
+        )
+        if desktop_error:
+            yield {"type": "error", "error": desktop_error["message"], "code": desktop_error["code"], **{
+                k: v for k, v in desktop_error.items() if k in ("last_seen", "host_device_id", "host_label")
+            }}
+            return
         if desktop_ctx:
             run_doc_data["runtime_context"] = frappe.as_json(
-                {"desktop": _desktop_runtime_context(desktop_ctx)}
+                {"desktop": _desktop_runtime_context(desktop_ctx, conversation.name)}
             )
 
         run_doc = frappe.get_doc(run_doc_data)
