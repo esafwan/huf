@@ -446,7 +446,7 @@ def fork_conversation(conversation_id: str, mode: str, title: str | None = None,
 
 
 @frappe.whitelist()
-def new_conversation(agent: str, message: str, skip_user_message=0, files=None, model_override: str | None = None, project: str | None = None):
+def new_conversation(agent: str, message: str, skip_user_message=0, files=None, model_override: str | None = None, project: str | None = None, desktop_executor_id: str | None = None):
 
     if not agent:
         frappe.throw(_("agent is required"))
@@ -468,6 +468,7 @@ def new_conversation(agent: str, message: str, skip_user_message=0, files=None, 
             conversation_id=conversation.name,
             skip_user_message=_is_truthy(skip_user_message),
             files=files,
+            desktop_executor_id=desktop_executor_id,
         )
 
         if run_result.get("conversation_id"):
@@ -477,11 +478,14 @@ def new_conversation(agent: str, message: str, skip_user_message=0, files=None, 
                 # Best-effort defensive update; ignore known validation failures.
                 pass
 
-        return {
+        response = {
             "success": True,
             "conversation_id": conversation.name,
             "run": run_result
         }
+        if isinstance(run_result, dict) and run_result.get("desktop_tools") is not None:
+            response["desktop_tools"] = run_result["desktop_tools"]
+        return response
 
     except Exception as e:  # boundary exception handler: API endpoint
         # API boundary: log unexpected failure with traceback, then re-raise.
@@ -496,6 +500,7 @@ def send_message_to_conversation(
     skip_user_message=0,
     files=None,
     model_override: str | None = None,
+    desktop_executor_id: str | None = None,
 ):
     if not conversation:
         frappe.throw(_("conversation is required"))
@@ -532,6 +537,7 @@ def send_message_to_conversation(
             conversation_id=conv_doc.name,
             skip_user_message=_is_truthy(skip_user_message),
             files=files,
+            desktop_executor_id=desktop_executor_id,
         )
 
         if result.get("conversation_id") and not conv_doc.name:

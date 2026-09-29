@@ -103,9 +103,11 @@ def _resolve_effective_model(agent_doc, model=None, provider=None):
 
 class AgentManager:
     """Manages the creation and execution of agents."""
-    def __init__(self, agent_name, file_handler=None, provider_override=None, model_override=None, conversation_id=None):
+    def __init__(self, agent_name, file_handler=None, provider_override=None, model_override=None, conversation_id=None, desktop_ctx=None):
         self.agent_doc = frappe.get_cached_doc("Agent", agent_name)
         self.conversation_id = conversation_id
+        # Pinned Huf Desktop executor context (None for every non-desktop run).
+        self.desktop_ctx = desktop_ctx
         (
             self.effective_provider,
             self.effective_model,
@@ -202,6 +204,7 @@ class AgentManager:
                 model_name=self.effective_model,
                 conversation_id=self.conversation_id,
                 agent_name=self.agent_doc.name,
+                desktop_ctx=self.desktop_ctx,
             )
             if agent_tools:
                 self.tools.extend(agent_tools)
@@ -1149,6 +1152,71 @@ def _link_preexisting_user_message(conversation_name: str, run_name: str):
 		frappe.db.set_value("Agent Message", msg_name, "agent_run", run_name, update_modified=False)
 
 
+def _resolve_desktop_request(desktop_executor_id):
+    """Resolve an optional ``desktop_executor_id`` once, at run start.
+
+    Returns ``(desktop_ctx, desktop_tools_status)``. Both are ``None`` when no
+    id was supplied (the web/PWA never sends one), so callers see zero change.
+    An id that is not a live lease owned by the session user is ignored with a
+    warning; it never raises, so it cannot break the chat.
+    """
+    if not desktop_executor_id:
+        return None, None
+    try:
+        from huf.ai.desktop_executor import resolve_desktop_ctx
+
+        ctx = resolve_desktop_ctx(desktop_executor_id, user=frappe.session.user)
+    except Exception as exc:  # never break the chat over an optional feature
+        frappe.logger("huf").warning(f"desktop executor resolution failed: {exc!s}")
+        ctx = None
+    if not ctx:
+        frappe.logger("huf").warning(
+            "Ignoring desktop_executor_id: no live lease owned by the session user"
+        )
+        return None, {"available": False, "reason": "executor_unavailable"}
+    return ctx, {"available": True, "reason": None}
+
+
+def _desktop_runtime_context(desktop_ctx):
+    """Persistable pin for ``runtime_context['desktop']`` (identifiers only, no secrets)."""
+    if not desktop_ctx:
+        return None
+    return {
+        "executor_id": desktop_ctx.get("executor_id"),
+        "fingerprint": desktop_ctx.get("fingerprint"),
+        "user": desktop_ctx.get("user"),
+        "label": desktop_ctx.get("label"),
+    }
+
+
+def _desktop_ctx_from_runtime_context(context):
+    """Re-resolve a pinned desktop ctx in the worker.
+
+    Returns the pinned ctx (with its original fingerprint, so a workspace switch
+    is still detected by the tools) only if the lease is still live and still
+    owned by the pinned user; otherwise None (run proceeds without desktop tools).
+    """
+    pinned = (context or {}).get("desktop")
+    if not pinned or not isinstance(pinned, dict):
+        return None
+    try:
+        from huf.ai.desktop_executor import resolve_desktop_ctx
+
+        live = resolve_desktop_ctx(pinned.get("executor_id"), user=pinned.get("user"))
+    except Exception as exc:
+        frappe.logger("huf").warning(f"desktop ctx re-resolution failed: {exc!s}")
+        return None
+    if not live:
+        return None
+    return {**live, "fingerprint": pinned.get("fingerprint") or live.get("fingerprint")}
+
+
+def _with_desktop_status(result, status):
+    if status is not None and isinstance(result, dict):
+        result["desktop_tools"] = status
+    return result
+
+
 @frappe.whitelist(allow_guest=True)
 @rate_limit(key="agent_name", limit=20, seconds=60, ip_based=True)
 def run_agent_sync(
@@ -1175,6 +1243,7 @@ def run_agent_sync(
     now=None,
     project: str = None,
     client_idempotency_key: str = None,
+    desktop_executor_id: str = None,
 ):
     """Run an agent synchronously (queue-first by default; see ``now``).
 
@@ -1309,6 +1378,8 @@ def run_agent_sync(
 
     sequence = _next_run_sequence(conversation.name)
 
+    desktop_ctx, desktop_status = _resolve_desktop_request(desktop_executor_id)
+
     runtime_context = {
         "channel_id": channel_id,
         "external_id": external_id,
@@ -1322,6 +1393,8 @@ def run_agent_sync(
         "files": files,
         "skip_user_message": skip_user_message,
     }
+    if desktop_ctx:
+        runtime_context["desktop"] = _desktop_runtime_context(desktop_ctx)
 
     run_doc_data = {
         "doctype": "Agent Run",
@@ -1370,7 +1443,7 @@ def run_agent_sync(
         )
         if existing_run_name:
             existing_run = frappe.get_doc("Agent Run", existing_run_name)
-            return {
+            return _with_desktop_status({
                 "success": True,
                 "queued": existing_run.status in ("Queued", "Started"),
                 "status": existing_run.status,
@@ -1380,7 +1453,7 @@ def run_agent_sync(
                 "conversation_id": existing_run.conversation,
                 "session_id": conv_manager.session_id,
                 "sequence": existing_run.sequence,
-            }
+            }, desktop_status)
         run_doc_data["idempotency_key"] = client_idempotency_key
 
     if not frappe.has_permission("Agent Run", "create"):
@@ -1410,6 +1483,7 @@ def run_agent_sync(
         "prompt_cache_options": prompt_cache_options,
         "files": files,
         "skip_user_message": skip_user_message,
+        "desktop_ctx": desktop_ctx,
     }
 
     is_queued = not getattr(agent_doc, "run_immediately", 0) and not _is_truthy(now)
@@ -1430,7 +1504,7 @@ def run_agent_sync(
         )
         _emit_run_lifecycle_event(run_doc, conversation, "queued")
         safe_commit()
-        return {
+        return _with_desktop_status({
             "success": True,
             "queued": True,
             "status": "Queued",
@@ -1440,7 +1514,7 @@ def run_agent_sync(
             "conversation_id": conversation.name,
             "session_id": conv_manager.session_id,
             "sequence": sequence,
-        }
+        }, desktop_status)
 
     # Direct path (``now`` override or Agent.run_immediately): preserve the
     # existing immediate behavior — persist the user message up front and
@@ -1501,7 +1575,7 @@ def run_agent_sync(
             _link_preexisting_user_message(conversation.name, run_doc.name)
         safe_commit()
 
-        return _execute_agent_run(**execution_kwargs)
+        return _with_desktop_status(_execute_agent_run(**execution_kwargs), desktop_status)
     finally:
         heartbeat.stop()
         try:
@@ -1672,6 +1746,7 @@ def _execute_agent_run(
     prompt_cache_options=None,
     files=None,
     skip_user_message=False,
+    desktop_ctx=None,
 ):
     """Execute an agent against an existing Agent Run and conversation.
 
@@ -1755,6 +1830,7 @@ def _execute_agent_run(
             provider_override=resolved_provider,
             model_override=resolved_model,
             conversation_id=conversation_id,
+            desktop_ctx=desktop_ctx,
         )
 
         if manager.tool_setup_warnings:
@@ -2762,6 +2838,7 @@ def _build_execution_kwargs(run_doc, context: dict):
         "prompt_cache_options": context.get("prompt_cache_options"),
         "files": context.get("files"),
         "skip_user_message": context.get("skip_user_message", False),
+        "desktop_ctx": _desktop_ctx_from_runtime_context(context),
     }
 
 
@@ -2860,6 +2937,7 @@ async def run_agent_stream(
     files=None,
     project: str = None,
     client_idempotency_key: str = None,
+    desktop_executor_id: str = None,
 ):
     """
     Streaming version of run_agent_sync.
@@ -3049,6 +3127,14 @@ async def run_agent_stream(
         if client_idempotency_key:
             run_doc_data["idempotency_key"] = client_idempotency_key
 
+        # Resolve the optional desktop executor once at run start and pin it on
+        # the run (tool handlers verify the run's pinned executor).
+        desktop_ctx, desktop_status = _resolve_desktop_request(desktop_executor_id)
+        if desktop_ctx:
+            run_doc_data["runtime_context"] = frappe.as_json(
+                {"desktop": _desktop_runtime_context(desktop_ctx)}
+            )
+
         run_doc = frappe.get_doc(run_doc_data)
         run_doc.insert()
         if not skip_user_message:
@@ -3057,6 +3143,9 @@ async def run_agent_stream(
             _link_preexisting_user_message(conversation.name, run_doc.name)
         run_doc.db_set("start_time", now_datetime())
         safe_commit()
+
+        if desktop_status is not None:
+            yield {"type": "desktop_tools", **desktop_status}
 
         # Update agent stats
         total_runs = frappe.db.count("Agent Run", filters={"agent": agent_name})
@@ -3073,6 +3162,7 @@ async def run_agent_stream(
             provider_override=resolved_provider,
             model_override=resolved_model,
             conversation_id=conversation.name,
+            desktop_ctx=desktop_ctx,
         )
 
         if manager.tool_setup_warnings:

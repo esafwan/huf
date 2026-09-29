@@ -162,6 +162,7 @@ class AgentStreamRenderer(BaseRenderer):
 		create_new = bool(_get_param("create_new", False))
 		skip_user_message = bool(_get_param("skip_user_message", False))
 		project = _get_param("project")
+		desktop_executor_id = _get_param("desktop_executor_id")
 		files = body.get("files")
 
 		create_new = bool(create_new)
@@ -213,6 +214,7 @@ class AgentStreamRenderer(BaseRenderer):
 					skip_user_message=skip_user_message,
 					files=files,
 					project=project,
+					desktop_executor_id=desktop_executor_id,
 				)
 				
 				# Convert async generator to sync

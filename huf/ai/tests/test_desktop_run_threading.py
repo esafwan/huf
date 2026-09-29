@@ -1,0 +1,271 @@
+# Copyright (c) 2026, Tridz Technologies Pvt Ltd and contributors
+# For license information, please see license.txt
+
+"""Tests for threading ``desktop_executor_id`` through run paths (H6).
+
+Covers: runtime_context pin persisted and read back (queued worker), the
+immediate and stream paths forwarding ``desktop_ctx``, foreign/invalid executor
+ids ignored, and no behavior change when the param is absent.
+
+Run with:
+	bench --site <site> run-tests --app huf --module huf.ai.tests.test_desktop_run_threading
+"""
+
+import json
+import unittest
+from unittest.mock import MagicMock, patch
+
+from huf.ai import agent_chat
+from huf.ai import agent_integration as ai
+from huf.ai.agent_stream_renderer import AgentStreamRenderer
+
+CTX = {"executor_id": "exec-1", "fingerprint": "fp1", "user": "u@example.com", "label": "ws"}
+
+
+def _agent_doc(**over):
+	doc = MagicMock()
+	doc.provider = "P"
+	doc.model = "m"
+	doc.allow_guest = 1
+	doc.allowed_users = []
+	doc.allowed_roles = []
+	doc.persist_conversation = 1
+	doc.prompt_mode = "Local"
+	doc.run_immediately = 0
+	for k, v in over.items():
+		setattr(doc, k, v)
+	return doc
+
+
+class TestResolveDesktopRequest(unittest.TestCase):
+	@patch("huf.ai.agent_integration.frappe")
+	def test_absent_param_is_noop(self, _f):
+		self.assertEqual(ai._resolve_desktop_request(None), (None, None))
+		self.assertEqual(ai._resolve_desktop_request(""), (None, None))
+
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	@patch("huf.ai.agent_integration.frappe")
+	def test_owned_lease_resolves(self, f, resolve):
+		f.session.user = "u@example.com"
+		ctx, status = ai._resolve_desktop_request("exec-1")
+		self.assertEqual(ctx, CTX)
+		self.assertEqual(status, {"available": True, "reason": None})
+		resolve.assert_called_once_with("exec-1", user="u@example.com")
+
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=None)
+	@patch("huf.ai.agent_integration.frappe")
+	def test_foreign_user_executor_ignored_with_warning(self, f, _resolve):
+		f.session.user = "other@example.com"
+		ctx, status = ai._resolve_desktop_request("exec-1")
+		self.assertIsNone(ctx)
+		self.assertEqual(status["available"], False)
+		self.assertTrue(status["reason"])
+		f.logger.return_value.warning.assert_called()
+
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", side_effect=RuntimeError("boom"))
+	@patch("huf.ai.agent_integration.frappe")
+	def test_resolution_error_never_raises(self, f, _resolve):
+		ctx, status = ai._resolve_desktop_request("exec-1")
+		self.assertIsNone(ctx)
+		self.assertFalse(status["available"])
+
+
+class TestRuntimeContextRoundTrip(unittest.TestCase):
+	def test_persisted_pin_has_no_secrets(self):
+		noisy = {**CTX, "api_secret": "s3cret", "token": "t"}
+		pin = ai._desktop_runtime_context(noisy)
+		self.assertEqual(set(pin), {"executor_id", "fingerprint", "user", "label"})
+		self.assertIsNone(ai._desktop_runtime_context(None))
+
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx")
+	def test_queued_worker_resolves_ctx_from_persisted_context(self, resolve):
+		context = json.loads(json.dumps({"desktop": ai._desktop_runtime_context(CTX)}))
+		resolve.return_value = {**CTX, "fingerprint": "fp-now"}
+		run_doc = MagicMock(agent="A", conversation="C", prompt="hi", provider="P", model="m")
+		run_doc.name = "AR-1"
+		kwargs = ai._build_execution_kwargs(run_doc, context)
+		resolve.assert_called_once_with("exec-1", user="u@example.com")
+		# Pinned fingerprint is kept so a workspace switch is still detectable.
+		self.assertEqual(kwargs["desktop_ctx"]["executor_id"], "exec-1")
+		self.assertEqual(kwargs["desktop_ctx"]["fingerprint"], "fp1")
+
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=None)
+	def test_queued_worker_expired_lease_gives_no_ctx(self, _resolve):
+		run_doc = MagicMock(agent="A", conversation="C", prompt="hi", provider="P", model="m")
+		kwargs = ai._build_execution_kwargs(run_doc, {"desktop": ai._desktop_runtime_context(CTX)})
+		self.assertIsNone(kwargs["desktop_ctx"])
+
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx")
+	def test_absent_pin_unchanged(self, resolve):
+		run_doc = MagicMock(agent="A", conversation="C", prompt="hi", provider="P", model="m")
+		kwargs = ai._build_execution_kwargs(run_doc, {})
+		self.assertIsNone(kwargs["desktop_ctx"])
+		resolve.assert_not_called()
+
+
+class TestAgentManagerPassesCtx(unittest.TestCase):
+	def test_setup_tools_passes_desktop_ctx(self):
+		mgr = ai.AgentManager.__new__(ai.AgentManager)
+		mgr.agent_doc = MagicMock()
+		mgr.agent_doc.name = "A"
+		mgr.effective_model = "m"
+		mgr.conversation_id = "C"
+		mgr.desktop_ctx = CTX
+		mgr.tool_setup_warnings = []
+		with patch("huf.ai.sdk_tools.create_agent_tools", return_value=[]) as cat, \
+				patch("huf.ai.mcp_client.create_mcp_tools", return_value=[]):
+			try:
+				mgr._setup_tools()
+			except Exception:
+				pass  # later setup stages are irrelevant here
+		self.assertEqual(cat.call_args.kwargs["desktop_ctx"], CTX)
+
+
+class TestRunAgentSyncThreading(unittest.TestCase):
+	def setUp(self):
+		self.conversation = MagicMock()
+		self.conversation.name = "CONV-1"
+		self.run_doc = MagicMock()
+		self.run_doc.name = "AR-1"
+		self.conv_manager = MagicMock()
+		self.conv_manager.session_id = "s"
+		self.conv_manager.get_or_create_conversation.return_value = self.conversation
+		self.conv_manager.create_new_conversation.return_value = self.conversation
+
+	def _get_doc(self, agent_doc):
+		def _g(first, *a, **k):
+			if first == "Agent":
+				return agent_doc
+			if first == "Agent Conversation":
+				return self.conversation
+			return self.run_doc
+		return _g
+
+	def _run(self, mock_frappe, mock_cm_cls, **kw):
+		mock_frappe.session.user = "u@example.com"
+		mock_frappe.get_doc.side_effect = self._get_doc(_agent_doc(run_immediately=kw.pop("immediate", 0)))
+		mock_frappe.db.get_value.return_value = None
+		mock_frappe.db.exists.return_value = False
+		mock_frappe.cache.return_value.set.return_value = True
+		mock_frappe.as_json.side_effect = json.dumps
+		mock_cm_cls.return_value = self.conv_manager
+		return ai.run_agent_sync(agent_name="A", prompt="hi", **kw)
+
+	def _persisted_context(self, mock_frappe):
+		data = mock_frappe.get_doc.call_args_list
+		for c in data:
+			if c.args and isinstance(c.args[0], dict) and c.args[0].get("doctype") == "Agent Run":
+				return json.loads(c.args[0]["runtime_context"])
+		self.fail("Agent Run doc not created")
+
+	@patch("huf.ai.agent_integration._execute_agent_run")
+	@patch("huf.ai.agent_integration.ConversationManager")
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	@patch("huf.ai.agent_integration.frappe")
+	def test_immediate_path_passes_ctx_and_status(self, f, _resolve, cm, execute):
+		execute.return_value = {"success": True}
+		result = self._run(f, cm, immediate=1, desktop_executor_id="exec-1")
+		self.assertEqual(execute.call_args.kwargs["desktop_ctx"], CTX)
+		self.assertEqual(result["desktop_tools"], {"available": True, "reason": None})
+		self.assertEqual(self._persisted_context(f)["desktop"]["executor_id"], "exec-1")
+
+	@patch("huf.ai.agent_integration._execute_agent_run")
+	@patch("huf.ai.agent_integration.ConversationManager")
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	@patch("huf.ai.agent_integration.frappe")
+	def test_queued_path_persists_pin_and_status(self, f, _resolve, cm, execute):
+		result = self._run(f, cm, desktop_executor_id="exec-1")
+		self.assertTrue(result["queued"])
+		execute.assert_not_called()
+		ctx = self._persisted_context(f)
+		self.assertEqual(ctx["desktop"], ai._desktop_runtime_context(CTX))
+		self.assertTrue(result["desktop_tools"]["available"])
+
+	@patch("huf.ai.agent_integration._execute_agent_run")
+	@patch("huf.ai.agent_integration.ConversationManager")
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=None)
+	@patch("huf.ai.agent_integration.frappe")
+	def test_foreign_executor_ignored_run_proceeds(self, f, _resolve, cm, execute):
+		execute.return_value = {"success": True}
+		result = self._run(f, cm, immediate=1, desktop_executor_id="someone-elses")
+		self.assertIsNone(execute.call_args.kwargs["desktop_ctx"])
+		self.assertNotIn("desktop", self._persisted_context(f))
+		self.assertFalse(result["desktop_tools"]["available"])
+
+	@patch("huf.ai.agent_integration._execute_agent_run")
+	@patch("huf.ai.agent_integration.ConversationManager")
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx")
+	@patch("huf.ai.agent_integration.frappe")
+	def test_absent_param_unchanged(self, f, resolve, cm, execute):
+		sentinel = {"success": True}
+		execute.return_value = sentinel
+		result = self._run(f, cm, immediate=1)
+		self.assertIs(result, sentinel)
+		self.assertNotIn("desktop_tools", result)
+		self.assertNotIn("desktop", self._persisted_context(f))
+		self.assertIsNone(execute.call_args.kwargs["desktop_ctx"])
+		resolve.assert_not_called()
+
+
+class TestChatEndpointsForward(unittest.TestCase):
+	@patch("huf.ai.agent_chat.run_agent_sync", return_value={"conversation_id": "C", "desktop_tools": {"available": False, "reason": "executor_unavailable"}})
+	@patch("huf.ai.agent_chat.frappe")
+	def test_send_message_forwards_param_and_returns_status(self, f, run):
+		conv = MagicMock(is_active=1, agent="A", model="m", channel="Chat")
+		conv.name = "C"
+		f.get_doc.return_value = conv
+		f.db.get_value.return_value = "P"
+		result = agent_chat.send_message_to_conversation("C", "hi", desktop_executor_id="exec-1")
+		self.assertEqual(run.call_args.kwargs["desktop_executor_id"], "exec-1")
+		self.assertFalse(result["desktop_tools"]["available"])
+
+	@patch("huf.ai.agent_chat.run_agent_sync", return_value={"conversation_id": "C"})
+	@patch("huf.ai.agent_chat.frappe")
+	def test_send_message_without_param_unchanged(self, f, run):
+		conv = MagicMock(is_active=1, agent="A", model="m", channel="Chat")
+		conv.name = "C"
+		f.get_doc.return_value = conv
+		f.db.get_value.return_value = "P"
+		result = agent_chat.send_message_to_conversation("C", "hi")
+		self.assertIsNone(run.call_args.kwargs["desktop_executor_id"])
+		self.assertNotIn("desktop_tools", result)
+
+	@patch("huf.ai.agent_chat.run_agent_sync", return_value={"conversation_id": "C", "desktop_tools": {"available": True, "reason": None}})
+	@patch("huf.ai.agent_chat.ConversationManager")
+	@patch("huf.ai.agent_chat.frappe")
+	def test_new_conversation_forwards_and_surfaces_status(self, f, cm, run):
+		cm.return_value.create_new_conversation.return_value = MagicMock(name="C")
+		f.db.get_value.return_value = "x"
+		result = agent_chat.new_conversation("A", "hi", desktop_executor_id="exec-1")
+		self.assertEqual(run.call_args.kwargs["desktop_executor_id"], "exec-1")
+		self.assertTrue(result["desktop_tools"]["available"])
+
+
+class TestStreamPathThreading(unittest.TestCase):
+	def _render(self, params):
+		renderer = AgentStreamRenderer.__new__(AgentStreamRenderer)
+		renderer.path = "huf/stream/a"
+		renderer.http_status_code = 200
+		agent_doc = _agent_doc(run_immediately=1)
+		captured = {}
+
+		async def fake_stream(**kwargs):
+			captured.update(kwargs)
+			yield {"type": "complete"}
+
+		with patch("huf.ai.agent_stream_renderer.frappe.form_dict", {"agent_name": "a", **params}), \
+				patch("huf.ai.agent_stream_renderer.frappe.request", new=MagicMock(method="GET")), \
+				patch("huf.ai.agent_stream_renderer.frappe.get_doc", return_value=agent_doc), \
+				patch("huf.ai.agent_stream_renderer.frappe.has_permission", return_value=True), \
+				patch("huf.ai.agent_stream_renderer.run_agent_stream", fake_stream):
+			response = renderer._render_agent_stream("a")
+			list(response.response)
+		return captured
+
+	def test_stream_route_forwards_param(self):
+		captured = self._render({"prompt": "hi", "desktop_executor_id": "exec-1"})
+		self.assertEqual(captured["desktop_executor_id"], "exec-1")
+
+	def test_stream_route_absent_param_is_none(self):
+		captured = self._render({"prompt": "hi"})
+		self.assertIsNone(captured["desktop_executor_id"])
