@@ -8,7 +8,44 @@ import threading
 
 import frappe
 
+from huf.ai import desktop_executor as dx
+
 FP = "0123456789abcdef"
+
+# Lease secrets returned by ``register_desktop_executor`` (a real desktop holds this in its main
+# process). The wrappers below present it the way Huf Desktop does, so tests exercise the real
+# secret-gated endpoints instead of bypassing them. Pass ``lease_secret=None`` to present none.
+SECRETS = {}
+
+
+def secret_of(executor_id):
+	return SECRETS.get(executor_id)
+
+
+def register_desktop_executor(*args, **kwargs):
+	"""Register through the real endpoint, remember the returned secret, and present the held
+	secret on a re-register of a live lease."""
+	eid = kwargs.get("executor_id")
+	kwargs.setdefault("lease_secret", SECRETS.get(eid))
+	out = dx.register_desktop_executor(*args, **kwargs)
+	SECRETS[eid] = out["lease_secret"]
+	return out
+
+
+def _with_secret(endpoint):
+	def call(*args, **kwargs):
+		kwargs.setdefault("lease_secret", SECRETS.get(kwargs.get("executor_id")))
+		return endpoint(*args, **kwargs)
+
+	call.__name__ = endpoint.__name__
+	return call
+
+
+heartbeat_desktop_executor = _with_secret(dx.heartbeat_desktop_executor)
+unregister_desktop_executor = _with_secret(dx.unregister_desktop_executor)
+register_desktop_catalog = _with_secret(dx.register_desktop_catalog)
+list_pending_desktop_tool_calls = _with_secret(dx.list_pending_desktop_tool_calls)
+submit_desktop_tool_event = _with_secret(dx.submit_desktop_tool_event)
 
 
 def make_user(prefix="dxtest"):
@@ -40,9 +77,18 @@ def delete_docs(pairs):
 	frappe.db.commit()
 
 
-def make_run(user, runtime_context):
+def make_run(user, runtime_context, resign=True):
 	"""Insert a real Agent Run owned by ``user`` whose runtime_context is a JSON STRING
-	(as ``run_agent_sync`` stores it). Returns the run name."""
+	(as ``run_agent_sync`` stores it). Returns the run name.
+
+	``resign`` (default) signs the desktop pin the way ``run_agent_sync`` does, so tests that edit a
+	pin dict before inserting it model a pin the server wrote. ``resign=False`` inserts it as given:
+	that is how a forged pin (a Huf User writing ``runtime_context`` directly) is modelled."""
+	if resign and isinstance((runtime_context or {}).get("desktop"), dict):
+		runtime_context = dict(runtime_context)
+		pin = dict(runtime_context["desktop"])
+		pin["sig"] = dx.sign_pin(pin, None)
+		runtime_context["desktop"] = pin
 	frappe.set_user(user)
 	run = frappe.get_doc(
 		{
@@ -57,8 +103,13 @@ def make_run(user, runtime_context):
 	return run.name
 
 
-def desktop_pin(executor_id, user, fingerprint=FP, label="my-project"):
-	return {"desktop": {"executor_id": executor_id, "fingerprint": fingerprint, "user": user, "label": label}}
+def desktop_pin(executor_id, user, fingerprint=FP, label="my-project", origin="desktop", conversation_id=None, **extra):
+	"""A run pin signed like ``run_agent_sync`` signs it (origin and policy are trusted only when
+	the signature verifies). ``extra`` keys (``agent_policy``, ``device_id``) are signed too."""
+	pin = {"executor_id": executor_id, "fingerprint": fingerprint, "user": user, "label": label, "origin": origin}
+	pin.update(extra)
+	pin["sig"] = dx.sign_pin(pin, conversation_id)
+	return {"desktop": pin}
 
 
 def workspace(fingerprint=FP, mode="ask"):

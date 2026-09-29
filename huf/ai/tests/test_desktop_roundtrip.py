@@ -53,7 +53,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 	def tearDown(self):
 		frappe.set_user(self.user)
 		try:
-			dx.unregister_desktop_executor(executor_id=self.exec_id)
+			h.unregister_desktop_executor(executor_id=self.exec_id)
 		except Exception:
 			pass
 		frappe.set_user("Administrator")
@@ -61,7 +61,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 	# helpers
 	def register(self, fingerprint=h.FP):
 		frappe.set_user(self.user)
-		return dx.register_desktop_executor(
+		return h.register_desktop_executor(
 			executor_id=self.exec_id,
 			protocol_version=1,
 			app_version="0.1",
@@ -101,7 +101,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			deadline = time.monotonic() + poll_for_s
 			seen = None
 			while time.monotonic() < deadline and seen is None:
-				for req in dx.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+				for req in h.list_pending_desktop_tool_calls(executor_id=self.exec_id):
 					if req["call_id"] == self.call_id:
 						seen = req
 				if seen is None:
@@ -114,7 +114,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 				results.append(
 					(
 						kind,
-						dx.submit_desktop_tool_event(
+						h.submit_desktop_tool_event(
 							call_id=self.call_id, executor_id=self.exec_id, kind=kind, payload=payload
 						),
 					)
@@ -169,7 +169,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			{"user": self.user, "executor_id": self.exec_id, "request": {"call_id": self.call_id}},
 			60,
 		)
-		out = dx.submit_desktop_tool_event(
+		out = h.submit_desktop_tool_event(
 			call_id=self.call_id, executor_id=self.exec_id, kind="ack", payload={}
 		)
 		self.assertEqual(out["status"], "recorded")
@@ -217,13 +217,13 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		self.assertEqual(out["error"]["code"], "denied_by_user")
 
 	def test_offline_lease_fails_fast_without_waiting(self):
-		dx.unregister_desktop_executor(executor_id=self.exec_id)
+		h.unregister_desktop_executor(executor_id=self.exec_id)
 		started = time.monotonic()
 		out = self.read_file()
 		self.assertLess(time.monotonic() - started, 2)
 		self.assertEqual(out["error"]["code"], "desktop_offline")
 		self.assertIn("not connected", out["error"]["message"])
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	def test_run_phase_timeout_when_desktop_acks_then_goes_silent(self):
 		thread, errors, _ = self.play_desktop([(0.1, "ack", {})])
@@ -262,7 +262,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 	def test_other_users_lease_is_not_reachable(self):
 		frappe.set_user(self.other)
 		with self.assertRaises(frappe.PermissionError):
-			dx.list_pending_desktop_tool_calls(executor_id=self.exec_id)
+			h.list_pending_desktop_tool_calls(executor_id=self.exec_id)
 		with self.assertRaises(frappe.PermissionError):
 			self.read_file(_dx_user=self.other)
 
@@ -287,7 +287,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 	def test_pin_naming_another_users_live_lease_is_dropped_for_a_run_owned_by_someone_else(self):
 		victim_exec = f"exec-victim-{frappe.generate_hash(length=8)}"
 		frappe.set_user(self.other)
-		dx.register_desktop_executor(
+		h.register_desktop_executor(
 			executor_id=victim_exec, protocol_version=1, workspace=h.workspace(), capabilities=CAPS
 		)
 		try:
@@ -306,7 +306,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			)
 		finally:
 			frappe.set_user(self.other)
-			dx.unregister_desktop_executor(executor_id=victim_exec)
+			h.unregister_desktop_executor(executor_id=victim_exec)
 			frappe.set_user(self.user)
 
 	def test_honest_pin_is_kept_for_the_run_owner(self):
@@ -397,9 +397,9 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		def answer(req):
 			cid = req["call_id"]
 			time.sleep(delay_s)
-			dx.submit_desktop_tool_event(call_id=cid, executor_id=self.exec_id, kind="ack", payload={})
+			h.submit_desktop_tool_event(call_id=cid, executor_id=self.exec_id, kind="ack", payload={})
 			time.sleep(delay_s)
-			dx.submit_desktop_tool_event(
+			h.submit_desktop_tool_event(
 				call_id=cid,
 				executor_id=self.exec_id,
 				kind="result",
@@ -408,7 +408,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 
 		def play():
 			while not stop.is_set():
-				for req in dx.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+				for req in h.list_pending_desktop_tool_calls(executor_id=self.exec_id):
 					cid = req["call_id"]
 					if cid in answered or (only and cid not in only):
 						continue
@@ -498,7 +498,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 				agent_run_id=self.run_name,
 				call_id=self.call_id,
 			)  # self-chosen ids, no pin (what a flow / procedure / API caller can do)
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	def test_handlers_refuse_a_forged_or_borrowed_pin(self):
 		for bad in ("", "0" * 64, "not-a-token", None, 12345):
@@ -547,7 +547,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		)
 		self.assertFalse(result.success)
 		self.assertTrue(result.denied)
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	# ---- N5 web budget
 	def test_web_request_with_a_used_up_budget_gets_a_structured_error_without_waiting(self):
@@ -558,7 +558,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 			out = self.read_file()
 		self.assertLess(time.monotonic() - started, 2)
 		self.assertEqual(out["error"]["code"], "web_budget_exhausted")
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 		# the very same state is fine for a queued (RQ) run
 		thread, errors, _ = self.play_desktop([(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "q"}})])
 		with mock.patch.object(dw, "_in_web_request", return_value=False):
@@ -721,7 +721,7 @@ class TestDesktopRoundTrip(unittest.TestCase):
 		r.zadd(xkey, {f"live-{i}": now + 60_000 for i in range(dx.MAX_INFLIGHT_PER_EXECUTOR)})
 		busy = self.read_file(call_id=f"{self.call_id}-busy")
 		self.assertEqual(busy["error"]["code"], "busy")
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	def test_a_queue_job_shares_one_wait_budget_across_the_runs_it_drains(self):
 		conversation = f"CONV-K3-{frappe.generate_hash(length=6)}"

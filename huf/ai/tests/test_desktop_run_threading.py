@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 from huf.ai import agent_chat
 from huf.ai import agent_integration as ai
+from huf.ai import desktop_executor as dx
+from huf.ai import desktop_policy
 from huf.ai.agent_stream_renderer import AgentStreamRenderer
 
 CTX = {"executor_id": "exec-1", "fingerprint": "fp1", "user": "u@example.com", "label": "ws"}
@@ -43,14 +45,29 @@ class TestResolveDesktopRequest(unittest.TestCase):
 		self.assertEqual(ai._resolve_desktop_request(None), (None, None))
 		self.assertEqual(ai._resolve_desktop_request(""), (None, None))
 
+	@patch("huf.ai.desktop_executor.origin_for", return_value="desktop")
 	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
 	@patch("huf.ai.agent_integration.frappe")
-	def test_owned_lease_resolves(self, f, resolve):
+	def test_owned_lease_resolves(self, f, resolve, _origin):
 		f.session.user = "u@example.com"
 		ctx, status = ai._resolve_desktop_request("exec-1")
-		self.assertEqual(ctx, CTX)
+		self.assertEqual(ctx, {**CTX, "origin": "desktop", "agent_policy": desktop_policy.default_policy()})
 		self.assertEqual(status, {"available": True, "reason": None})
 		resolve.assert_called_once_with("exec-1", user="u@example.com")
+
+	@patch("huf.ai.desktop_executor.lease_remote_control", return_value=True)
+	@patch("huf.ai.desktop_executor.origin_for", return_value="remote")
+	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
+	@patch("huf.ai.agent_integration.frappe")
+	def test_remote_origin_needs_the_agent_flag_and_the_desktop_switch(self, f, _resolve, _origin, _rc):
+		f.session.user = "u@example.com"
+		agent_off = {"allow_remote_desktop": 0}
+		ctx, status = ai._resolve_desktop_request("exec-1", None, agent_off)
+		self.assertIsNone(ctx)
+		self.assertEqual(status, {"available": False, "reason": "remote_disabled"})
+		ctx, status = ai._resolve_desktop_request("exec-1", None, {"allow_remote_desktop": 1})
+		self.assertEqual(ctx["origin"], "remote")
+		self.assertTrue(status["available"])
 
 	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=None)
 	@patch("huf.ai.agent_integration.frappe")
@@ -74,7 +91,8 @@ class TestRuntimeContextRoundTrip(unittest.TestCase):
 	def test_persisted_pin_has_no_secrets(self):
 		noisy = {**CTX, "api_secret": "s3cret", "token": "t"}
 		pin = ai._desktop_runtime_context(noisy)
-		self.assertEqual(set(pin), {"executor_id", "fingerprint", "user", "label"})
+		self.assertEqual(set(pin), {"executor_id", "fingerprint", "user", "label", "sig"})
+		self.assertTrue(dx.verify_pin(pin))
 		self.assertIsNone(ai._desktop_runtime_context(None))
 
 	@patch("huf.ai.desktop_executor.resolve_desktop_ctx")
@@ -211,25 +229,33 @@ class TestRunAgentSyncThreading(unittest.TestCase):
 
 	@patch("huf.ai.agent_integration._execute_agent_run")
 	@patch("huf.ai.agent_integration.ConversationManager")
+	@patch("huf.ai.desktop_executor.origin_for", return_value="desktop")
 	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
 	@patch("huf.ai.agent_integration.frappe")
-	def test_immediate_path_passes_ctx_and_status(self, f, _resolve, cm, execute):
+	def test_immediate_path_passes_ctx_and_status(self, f, _resolve, _origin, cm, execute):
 		execute.return_value = {"success": True}
 		result = self._run(f, cm, immediate=1, desktop_executor_id="exec-1")
-		self.assertEqual(execute.call_args.kwargs["desktop_ctx"], CTX)
+		passed = execute.call_args.kwargs["desktop_ctx"]
+		self.assertEqual({k: passed[k] for k in CTX}, CTX)
+		self.assertEqual(passed["origin"], "desktop")
 		self.assertEqual(result["desktop_tools"], {"available": True, "reason": None})
 		self.assertEqual(self._persisted_context(f)["desktop"]["executor_id"], "exec-1")
 
 	@patch("huf.ai.agent_integration._execute_agent_run")
 	@patch("huf.ai.agent_integration.ConversationManager")
+	@patch("huf.ai.desktop_executor.origin_for", return_value="desktop")
 	@patch("huf.ai.desktop_executor.resolve_desktop_ctx", return_value=CTX)
 	@patch("huf.ai.agent_integration.frappe")
-	def test_queued_path_persists_pin_and_status(self, f, _resolve, cm, execute):
+	def test_queued_path_persists_pin_and_status(self, f, _resolve, _origin, cm, execute):
 		result = self._run(f, cm, desktop_executor_id="exec-1")
 		self.assertTrue(result["queued"])
 		execute.assert_not_called()
 		ctx = self._persisted_context(f)
-		self.assertEqual(ctx["desktop"], ai._desktop_runtime_context(CTX))
+		pin = ctx["desktop"]
+		self.assertEqual({k: pin[k] for k in CTX}, CTX)
+		self.assertEqual(pin["origin"], "desktop")
+		# signed for THIS conversation, so the worker can trust origin and policy
+		self.assertTrue(dx.verify_pin(pin, "CONV-1"))
 		self.assertTrue(result["desktop_tools"]["available"])
 
 	@patch("huf.ai.agent_integration._execute_agent_run")

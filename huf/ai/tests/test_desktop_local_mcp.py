@@ -23,6 +23,7 @@ import frappe
 from huf.ai import desktop_executor as dx
 from huf.ai import desktop_mcp as dm
 from huf.ai.tests import desktop_local_test_support as sup
+from huf.ai.tests import desktop_test_helpers as h
 from huf.ai.tests.desktop_local_test_support import BIDI, catalog, obj_schema, server, tool
 from huf.ai.tools import desktop_local as dl
 from huf.ai.tools._registry import (
@@ -735,7 +736,7 @@ class TestExposure(sup.ExposureBase):
 		self.assertEqual(self.mcp_tools(agent, {}), {})
 		ctx = self.ctx(digest)
 		self.assertEqual(self.mcp_tools(agent, dict(ctx, user=self.other)), {})
-		dx.unregister_desktop_executor(executor_id=self.exec_id)
+		h.unregister_desktop_executor(executor_id=self.exec_id)
 		self.assertEqual(self.mcp_tools(agent, ctx), {})
 
 	def test_tools_are_built_from_the_pinned_catalog_not_the_current_one(self):

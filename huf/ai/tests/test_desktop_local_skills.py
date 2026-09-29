@@ -71,14 +71,14 @@ class LocalSkillsBase(unittest.TestCase):
 	def tearDown(self):
 		frappe.set_user(self.user)
 		try:
-			dx.unregister_desktop_executor(executor_id=self.exec_id)
+			h.unregister_desktop_executor(executor_id=self.exec_id)
 		except Exception:
 			pass
 		frappe.set_user("Administrator")
 
 	def register(self, caps=ALL_CAPS, executor_id=None):
 		frappe.set_user(self.user)
-		return dx.register_desktop_executor(
+		return h.register_desktop_executor(
 			executor_id=executor_id or self.exec_id,
 			protocol_version=1,
 			app_version="0.1",
@@ -89,7 +89,7 @@ class LocalSkillsBase(unittest.TestCase):
 
 	def publish(self, cat):
 		frappe.set_user(self.user)
-		return dx.register_desktop_catalog(executor_id=self.exec_id, catalog=cat)
+		return h.register_desktop_catalog(executor_id=self.exec_id, catalog=cat)
 
 	def stored(self, digest):
 		return dx.get_catalog(self.exec_id, digest)
@@ -216,15 +216,15 @@ class TestCatalogEndpoint(LocalSkillsBase):
 	def test_only_the_lease_owner_can_publish_and_a_missing_lease_asks_to_reregister(self):
 		frappe.set_user(self.other)
 		with self.assertRaises(frappe.PermissionError):
-			dx.register_desktop_catalog(executor_id=self.exec_id, catalog=catalog(skill("alpha")))
+			h.register_desktop_catalog(executor_id=self.exec_id, catalog=catalog(skill("alpha")))
 		frappe.set_user(self.user)
-		out = dx.register_desktop_catalog(executor_id="exec-ls-noexist1", catalog=catalog())
+		out = h.register_desktop_catalog(executor_id="exec-ls-noexist1", catalog=catalog())
 		self.assertEqual(out, {"ok": False, "reregister": True})
 
 	def test_guest_cannot_publish(self):
 		frappe.set_user("Guest")
 		with self.assertRaises(frappe.PermissionError):
-			dx.register_desktop_catalog(executor_id=self.exec_id, catalog=catalog())
+			h.register_desktop_catalog(executor_id=self.exec_id, catalog=catalog())
 
 	def test_get_catalog_rejects_malformed_hashes_and_other_executors(self):
 		digest = self.publish(catalog(skill("alpha")))["catalog_hash"]
@@ -235,7 +235,7 @@ class TestCatalogEndpoint(LocalSkillsBase):
 	# ---- heartbeat handshake
 	def heartbeat(self, **kw):
 		frappe.set_user(self.user)
-		return dx.heartbeat_desktop_executor(executor_id=self.exec_id, **kw)
+		return h.heartbeat_desktop_executor(executor_id=self.exec_id, **kw)
 
 	def test_heartbeat_without_a_hash_never_asks_for_a_catalog(self):
 		self.assertEqual(set(self.heartbeat()), {"ok", "pending_call_ids"})
@@ -249,7 +249,7 @@ class TestCatalogEndpoint(LocalSkillsBase):
 
 	def test_lease_recreated_without_a_catalog_asks_the_desktop_to_publish_again(self):
 		digest = self.publish(catalog(skill("alpha")))["catalog_hash"]
-		dx.unregister_desktop_executor(executor_id=self.exec_id)
+		h.unregister_desktop_executor(executor_id=self.exec_id)
 		self.register()
 		self.assertTrue(self.heartbeat(catalog_hash=digest)["recatalog"])
 
@@ -367,7 +367,7 @@ class TestSkillDispatch(LocalSkillsBase):
 			deadline = time.monotonic() + 15
 			req = None
 			while time.monotonic() < deadline and req is None:
-				for r in dx.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+				for r in h.list_pending_desktop_tool_calls(executor_id=self.exec_id):
 					if r["agent_run_id"] == (run_name or self.run_name):
 						req = r
 				if req is None:
@@ -377,7 +377,7 @@ class TestSkillDispatch(LocalSkillsBase):
 			seen.append(req)
 			for delay, kind, payload in script:
 				time.sleep(delay)
-				dx.submit_desktop_tool_event(
+				h.submit_desktop_tool_event(
 					call_id=req["call_id"], executor_id=self.exec_id, kind=kind, payload=payload
 				)
 
@@ -389,7 +389,7 @@ class TestSkillDispatch(LocalSkillsBase):
 		self.assertEqual(errors, [])
 
 	def nothing_was_published(self):
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 		self.assertIsNone(dx._get(dx._request_key(self.call_id)))
 
 	def test_skill_read_of_skill_md_is_trusted_and_carries_the_pinned_hash(self):
@@ -478,7 +478,7 @@ class TestSkillDispatch(LocalSkillsBase):
 		frappe.set_user(self.user)
 		out = dl.handle_skill_list(**self.kwargs(agent_run_id=bare))
 		self.assertEqual(out["error"]["code"], "tool_unavailable")
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	def test_an_expired_pinned_catalog_is_refused(self):
 		dx._delete(dx._catalog_key(self.exec_id, self.cat))
@@ -536,7 +536,7 @@ class TestSkillDispatch(LocalSkillsBase):
 			result = asyncio.run(invoke_tool(name, {"skill": "local:claude/alpha", "path": "a"}))
 			self.assertFalse(result.success, name)
 			self.assertTrue(result.denied, name)
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 
 class TestHandlerParams(unittest.TestCase):
@@ -791,7 +791,7 @@ class TestExposure(LocalSkillsBase):
 		self.assertEqual(self.build(self.agent(self.ALL3), None), {})
 		self.assertEqual(self.build(self.agent(self.ALL3), {}), {})
 		ctx = self.ctx(digest)
-		dx.unregister_desktop_executor(executor_id=self.exec_id)
+		h.unregister_desktop_executor(executor_id=self.exec_id)
 		self.assertEqual(self.build(self.agent(self.ALL3), ctx), {})
 
 	def test_another_users_lease_gives_no_tools(self):
@@ -860,7 +860,7 @@ class TestExposure(LocalSkillsBase):
 		digest = self.publish(catalog(skill("alpha", scripts=True), skill("beta", scripts=True)))["catalog_hash"]
 		server = self.server_skill("alpha")
 		tools = self.build(self.agent(self.ALL3, skills=[server]), self.ctx(digest))
-		run = h.make_run(self.user, {"desktop": {**h.desktop_pin(self.exec_id, self.user)["desktop"], "catalog_hash": digest}})
+		run = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user, catalog_hash=digest))
 		self._docs.append(("Agent Run", run))
 		frappe.set_user(self.user)
 		sdk_ctx = SimpleNamespace(context={"agent_run_id": run}, tool_call_id="tc1")
@@ -868,7 +868,7 @@ class TestExposure(LocalSkillsBase):
 			tools["desktop_skill_read"].on_invoke_tool(sdk_ctx, json.dumps({"skill": "local:claude/alpha"}))
 		)
 		self.assertIn("server skill", out)
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	def test_workspace_tools_still_expose_next_to_the_skill_tools(self):
 		self.register()
@@ -884,7 +884,7 @@ class TestExposure(LocalSkillsBase):
 		out = self.register(caps=["fs.read", "fs.write", "fs.trash", "exec"])
 		self.assertTrue(out["ok"])
 		frappe.set_user(self.user)
-		hb = dx.heartbeat_desktop_executor(executor_id=self.exec_id)
+		hb = h.heartbeat_desktop_executor(executor_id=self.exec_id)
 		self.assertEqual(set(hb), {"ok", "pending_call_ids"})
 		frappe.set_user("Administrator")
 		agent = self.agent(list(DESKTOP_WORKSPACE_TOOL_NAMES) + list(self.ALL3))
@@ -898,7 +898,7 @@ class TestExposure(LocalSkillsBase):
 		self.register()
 		digest = self.publish(catalog(skill("alpha", desc="Alpha")))["catalog_hash"]
 		tools = self.build(self.agent(self.ALL3), self.ctx(digest))
-		run = h.make_run(self.user, {"desktop": {**h.desktop_pin(self.exec_id, self.user)["desktop"], "catalog_hash": digest}})
+		run = h.make_run(self.user, h.desktop_pin(self.exec_id, self.user, catalog_hash=digest))
 		self._docs.append(("Agent Run", run))
 		frappe.set_user(self.user)
 		seen = []
@@ -906,7 +906,7 @@ class TestExposure(LocalSkillsBase):
 		def desktop():
 			deadline = time.monotonic() + 15
 			while time.monotonic() < deadline and not seen:
-				for r in dx.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+				for r in h.list_pending_desktop_tool_calls(executor_id=self.exec_id):
 					if r["agent_run_id"] == run:
 						seen.append(r)
 				time.sleep(0.1)
@@ -915,7 +915,7 @@ class TestExposure(LocalSkillsBase):
 				("ack", {}),
 				("result", {"ok": True, "data": {"content": "# Alpha\nbody", "sha256": "1"}}),
 			):
-				dx.submit_desktop_tool_event(call_id=r["call_id"], executor_id=self.exec_id, kind=kind, payload=payload)
+				h.submit_desktop_tool_event(call_id=r["call_id"], executor_id=self.exec_id, kind=kind, payload=payload)
 
 		thread, errors = h.run_in_thread(desktop)
 		sdk_ctx = SimpleNamespace(context={"agent_run_id": run, "conversation_id": "CONV-x"}, tool_call_id="tc-1")

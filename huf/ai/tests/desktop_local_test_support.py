@@ -88,14 +88,14 @@ class LocalBase(unittest.TestCase):
 	def tearDown(self):
 		frappe.set_user(self.user)
 		try:
-			dx.unregister_desktop_executor(executor_id=self.exec_id)
+			h.unregister_desktop_executor(executor_id=self.exec_id)
 		except Exception:
 			pass
 		frappe.set_user("Administrator")
 
 	def register(self, caps=ALL_CAPS):
 		frappe.set_user(self.user)
-		return dx.register_desktop_executor(
+		return h.register_desktop_executor(
 			executor_id=self.exec_id,
 			protocol_version=1,
 			app_version="0.1",
@@ -106,7 +106,7 @@ class LocalBase(unittest.TestCase):
 
 	def publish(self, cat):
 		frappe.set_user(self.user)
-		return dx.register_desktop_catalog(executor_id=self.exec_id, catalog=cat)
+		return h.register_desktop_catalog(executor_id=self.exec_id, catalog=cat)
 
 	def make_run(self, catalog_hash=None, origin=None):
 		pin = h.desktop_pin(self.exec_id, self.user)
@@ -139,7 +139,7 @@ class LocalBase(unittest.TestCase):
 			deadline = time.monotonic() + 15
 			req = None
 			while time.monotonic() < deadline and req is None:
-				for r in dx.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+				for r in h.list_pending_desktop_tool_calls(executor_id=self.exec_id):
 					if r["agent_run_id"] == run:
 						req = r
 				if req is None:
@@ -149,7 +149,7 @@ class LocalBase(unittest.TestCase):
 			seen.append(req)
 			for delay, kind, payload in script:
 				time.sleep(delay)
-				dx.submit_desktop_tool_event(
+				h.submit_desktop_tool_event(
 					call_id=req["call_id"], executor_id=self.exec_id, kind=kind, payload=payload
 				)
 
@@ -161,7 +161,7 @@ class LocalBase(unittest.TestCase):
 		self.assertEqual(errors, [])
 
 	def nothing_was_published(self):
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
 
 	def ok(self, data=None):
 		return [(0.05, "ack", {}), (0.05, "result", {"ok": True, "data": data if data is not None else {}})]

@@ -20,6 +20,7 @@ from unittest import mock
 import frappe
 
 from huf.ai import desktop_executor as dx
+from huf.ai.tests import desktop_test_helpers as h
 
 EXEC_ID = "exec-0001-aaaa"
 FP = "0123456789abcdef"
@@ -214,7 +215,7 @@ class DesktopExecutorTestCase(unittest.TestCase):
 	# helpers
 	def register(self, user=USER, executor_id=EXEC_ID, caps=None, ws=None):
 		self.session.user = user
-		return dx.register_desktop_executor(
+		return h.register_desktop_executor(
 			executor_id=executor_id,
 			protocol_version=1,
 			app_version="0.1",
@@ -228,7 +229,7 @@ class DesktopExecutorTestCase(unittest.TestCase):
 
 	def desktop_submit(self, call_id, kind, payload=None, user=USER, executor_id=EXEC_ID):
 		self.session.user = user
-		return dx.submit_desktop_tool_event(
+		return h.submit_desktop_tool_event(
 			call_id=call_id, executor_id=executor_id, kind=kind, payload=payload or {}
 		)
 
@@ -250,6 +251,7 @@ class DesktopExecutorTestCase(unittest.TestCase):
 class TestLease(DesktopExecutorTestCase):
 	def test_register_returns_wire_shape_and_stores_lease_with_ttl(self):
 		res = self.register()
+		secret = res.pop("lease_secret")
 		self.assertEqual(
 			res,
 			{
@@ -257,9 +259,22 @@ class TestLease(DesktopExecutorTestCase):
 				"lease_ttl_s": 60,
 				"heartbeat_s": 20,
 				"protocol_version": 1,
-				"features": {"catalog": 1, "skills": True, "proc": True, "mcp": True, "browser": True},
+				"features": {
+					"catalog": 1,
+					"skills": True,
+					"proc": True,
+					"mcp": True,
+					"browser": True,
+					"device": True,
+					"control": True,
+					"lease_secret": True,
+				},
 			},
 		)
+		# the secret is returned once and only its hash is stored on the lease
+		stored = self.cache.values[dx._lease_key(EXEC_ID)]
+		self.assertNotIn(secret, json.dumps(stored, default=str))
+		self.assertTrue(dx.secret_matches(stored, secret))
 		lease = self.cache.values[dx._lease_key(EXEC_ID)]
 		self.assertEqual(lease["user"], USER)
 		self.assertEqual(lease["workspace"]["fingerprint"], FP)
@@ -269,12 +284,12 @@ class TestLease(DesktopExecutorTestCase):
 	def test_register_rejects_guest_and_bad_protocol(self):
 		self.session.user = "Guest"
 		with self.assertRaises(frappe.PermissionError):
-			dx.register_desktop_executor(
+			h.register_desktop_executor(
 				executor_id=EXEC_ID, protocol_version=1, workspace=_ws(), capabilities=[]
 			)
 		self.session.user = USER
 		with self.assertRaises(frappe.ValidationError):
-			dx.register_desktop_executor(
+			h.register_desktop_executor(
 				executor_id=EXEC_ID, protocol_version=2, workspace=_ws(), capabilities=[]
 			)
 
@@ -292,7 +307,7 @@ class TestLease(DesktopExecutorTestCase):
 
 	def test_workspace_accepts_json_string(self):
 		self.session.user = USER
-		res = dx.register_desktop_executor(
+		res = h.register_desktop_executor(
 			executor_id=EXEC_ID,
 			protocol_version="1",
 			workspace=json.dumps(_ws()),
@@ -304,7 +319,7 @@ class TestLease(DesktopExecutorTestCase):
 	def test_heartbeat_refreshes_ttl_and_socket_flag(self):
 		self.register()
 		self.cache.expiries[dx._lease_key(EXEC_ID)] = 3
-		res = dx.heartbeat_desktop_executor(
+		res = h.heartbeat_desktop_executor(
 			executor_id=EXEC_ID, workspace=_ws(mode="auto"), socket_connected=False
 		)
 		self.assertEqual(res, {"ok": True, "pending_call_ids": []})
@@ -316,29 +331,29 @@ class TestLease(DesktopExecutorTestCase):
 	def test_heartbeat_after_expiry_asks_reregister_then_register_works(self):
 		self.register()
 		self.cache.expire_lease(EXEC_ID)
-		res = dx.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)
+		res = h.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)
 		self.assertEqual(res, {"ok": False, "reregister": True})
 		self.assertTrue(self.register()["ok"])
 		self.assertTrue(
-			dx.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)["ok"]
+			h.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)["ok"]
 		)
 
 	def test_heartbeat_other_user_rejected(self):
 		self.register()
 		self.session.user = OTHER
 		with self.assertRaises(frappe.PermissionError):
-			dx.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)
+			h.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)
 
 	def test_unregister_removes_lease_only_for_owner(self):
 		self.register()
 		self.session.user = OTHER
 		with self.assertRaises(frappe.PermissionError):
-			dx.unregister_desktop_executor(executor_id=EXEC_ID)
+			h.unregister_desktop_executor(executor_id=EXEC_ID)
 		self.session.user = USER
-		self.assertEqual(dx.unregister_desktop_executor(executor_id=EXEC_ID), {"ok": True})
+		self.assertEqual(h.unregister_desktop_executor(executor_id=EXEC_ID), {"ok": True})
 		self.assertIsNone(self.cache.values.get(dx._lease_key(EXEC_ID)))
 		# idempotent
-		self.assertEqual(dx.unregister_desktop_executor(executor_id=EXEC_ID), {"ok": True})
+		self.assertEqual(h.unregister_desktop_executor(executor_id=EXEC_ID), {"ok": True})
 
 	def test_resolve_desktop_ctx(self):
 		self.register()
@@ -1226,19 +1241,19 @@ class TestSubmit(DesktopExecutorTestCase):
 		self.assertEqual(self.desktop_submit("call-1", "ack")["status"], "recorded")
 
 	def test_list_pending_and_heartbeat_report_unexpired_calls(self):
-		res = dx.list_pending_desktop_tool_calls(executor_id=EXEC_ID)
+		res = h.list_pending_desktop_tool_calls(executor_id=EXEC_ID)
 		self.assertEqual([r["call_id"] for r in res], ["call-1"])
-		hb = dx.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)
+		hb = h.heartbeat_desktop_executor(executor_id=EXEC_ID, workspace=_ws(), socket_connected=True)
 		self.assertEqual(hb["pending_call_ids"], ["call-1"])
 
 		# past deadline: pruned
 		self.cache.zsets[dx._pending_key(EXEC_ID)]["call-1"] = dx._now_ms() - 5
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=EXEC_ID), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=EXEC_ID), [])
 
 	def test_list_pending_other_user_rejected_and_no_lease_is_empty(self):
 		self.session.user = OTHER
 		with self.assertRaises(frappe.PermissionError):
-			dx.list_pending_desktop_tool_calls(executor_id=EXEC_ID)
+			h.list_pending_desktop_tool_calls(executor_id=EXEC_ID)
 		self.session.user = USER
 		self.cache.expire_lease(EXEC_ID)
-		self.assertEqual(dx.list_pending_desktop_tool_calls(executor_id=EXEC_ID), [])
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=EXEC_ID), [])

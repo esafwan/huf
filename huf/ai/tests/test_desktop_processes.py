@@ -310,7 +310,7 @@ class TestExposure(sup.ExposureBase):
 		ctx = self.ctx()
 		other_ctx = dict(ctx, user=self.other)
 		self.assertEqual(self.procs(agent, other_ctx), {})
-		dx.unregister_desktop_executor(executor_id=self.exec_id)
+		h.unregister_desktop_executor(executor_id=self.exec_id)
 		self.assertEqual(self.procs(agent, ctx), {})
 
 	def test_an_old_desktop_without_proc_is_unchanged(self):
