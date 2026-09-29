@@ -257,7 +257,7 @@ class TestLease(DesktopExecutorTestCase):
 				"lease_ttl_s": 60,
 				"heartbeat_s": 20,
 				"protocol_version": 1,
-				"features": {"catalog": 1, "skills": True},
+				"features": {"catalog": 1, "skills": True, "proc": True, "mcp": True, "browser": True},
 			},
 		)
 		lease = self.cache.values[dx._lease_key(EXEC_ID)]
