@@ -14,12 +14,12 @@ import json
 from unittest.mock import MagicMock, patch
 
 import frappe
-from frappe.test_runner import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 
 from huf.ai.tools import desktop_workspace
 
 
-class TestDesktopWorkspacePathValidation(FrappeTestCase):
+class TestDesktopWorkspacePathValidation(IntegrationTestCase):
 	"""Test path validation (S2, S8)."""
 
 	def test_absolute_path_rejected(self):
@@ -85,7 +85,7 @@ class TestDesktopWorkspacePathValidation(FrappeTestCase):
 		self.assertEqual(result, "42")
 
 
-class TestDesktopWorkspaceParameterValidation(FrappeTestCase):
+class TestDesktopWorkspaceParameterValidation(IntegrationTestCase):
 	"""Test parameter size validation."""
 
 	def test_512kb_reject(self):
@@ -116,7 +116,7 @@ class TestDesktopWorkspaceParameterValidation(FrappeTestCase):
 			desktop_workspace._validate_params_size(large_params)
 
 
-class TestDesktopWorkspaceParameterClamping(FrappeTestCase):
+class TestDesktopWorkspaceParameterClamping(IntegrationTestCase):
 	"""Test parameter clamping (depth, limit, timeout_seconds, etc.)."""
 
 	def test_depth_clamped_to_1_3(self):
@@ -194,7 +194,7 @@ class TestDesktopWorkspaceParameterClamping(FrappeTestCase):
 			)
 
 
-class TestDesktopWorkspaceExecutorContextValidation(FrappeTestCase):
+class TestDesktopWorkspaceExecutorContextValidation(IntegrationTestCase):
 	"""Test executor context validation (S29 - agent_run half)."""
 
 	def setUp(self):
@@ -282,7 +282,7 @@ class TestDesktopWorkspaceExecutorContextValidation(FrappeTestCase):
 			)
 
 
-class TestDesktopWorkspaceHandlerUntrustedContent(FrappeTestCase):
+class TestDesktopWorkspaceHandlerUntrustedContent(IntegrationTestCase):
 	"""Test that read and exec operations flag untrusted_content."""
 
 	def setUp(self):
@@ -388,7 +388,7 @@ class TestDesktopWorkspaceHandlerUntrustedContent(FrappeTestCase):
 			self.assertNotIn("untrusted_content", result)
 
 
-class TestDesktopWorkspaceErrorHandling(FrappeTestCase):
+class TestDesktopWorkspaceErrorHandling(IntegrationTestCase):
 	"""Test error handling and dispatch communication."""
 
 	def setUp(self):
@@ -486,7 +486,7 @@ class TestDesktopWorkspaceErrorHandling(FrappeTestCase):
 		self.assertIn("empty", str(ctx.exception).lower())
 
 
-class TestDesktopWorkspaceModeDefaults(FrappeTestCase):
+class TestDesktopWorkspaceModeDefaults(IntegrationTestCase):
 	"""Test mode parameter defaults and coercion."""
 
 	def setUp(self):
