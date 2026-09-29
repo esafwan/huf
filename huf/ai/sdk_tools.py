@@ -253,6 +253,9 @@ def _build_desktop_tools(function_docs, desktop_ctx, agent=None) -> list:
     additionally needs, per tool, the lease capability (``skills.read`` / ``skills.exec``) and a
     catalog PINNED to the run (``desktop_ctx['catalog_hash']``, never the lease's current one)
     that names at least one enabled skill (one with scripts for ``desktop_skill_run``).
+    ``processes`` needs the ``proc`` capability. ``mcp`` (local MCP servers, ``desktop_local_mcp``,
+    ``desktop_mcp_find``/``desktop_mcp_call``, and the ``desktop_browser`` grant) is expanded from
+    the pinned catalog by :func:`_build_local_mcp_tools`.
     """
     if not desktop_ctx or not isinstance(desktop_ctx, dict):
         return []
