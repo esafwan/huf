@@ -77,14 +77,18 @@ def delete_docs(pairs):
 	frappe.db.commit()
 
 
-def make_run(user, runtime_context, resign=True, conversation=None):
+def make_run(user, runtime_context, resign=True, conversation=None, claim=True):
 	"""Insert a real Agent Run owned by ``user`` whose runtime_context is a JSON STRING
 	(as ``run_agent_sync`` stores it). Returns the run name.
 
 	``resign`` (default) signs the desktop pin the way ``run_agent_sync`` does: AFTER the insert, bound
 	to the run that now exists (its name, conversation, agent, creation and prompt). So tests that
 	edit a pin dict before inserting it model a pin the server wrote. ``resign=False`` inserts it as
-	given: that is how a forged pin (a Huf User writing ``runtime_context`` directly) is modelled."""
+	given: that is how a forged pin (a Huf User writing ``runtime_context`` directly) is modelled.
+
+	``claim`` (default) also claims a desktop-origin pin the way the worker that drains the run does
+	(``claim_desktop_pin``): desktop origin is single-use, and the tool handlers only honour it in the
+	job that holds the claim. ``claim=False`` leaves the pin unclaimed, i.e. a replayed run."""
 	frappe.set_user(user)
 	run = frappe.get_doc(
 		{
@@ -105,6 +109,8 @@ def make_run(user, runtime_context, resign=True, conversation=None):
 			"Agent Run", run.name, "runtime_context", frappe.as_json(runtime_context), update_modified=False
 		)
 	frappe.db.commit()
+	if claim and resign and (runtime_context or {}).get("desktop", {}).get("origin") == "desktop":
+		dx.claim_desktop_pin(run.name)
 	return run.name
 
 
