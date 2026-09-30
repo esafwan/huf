@@ -1516,9 +1516,116 @@ class TestRunPinBinding(RemoteBase):
 		frappe.db.commit()
 		return run.name
 
+	def new_job(self):
+		"""A different worker job or request: it does not hold the claim an earlier one made."""
+		frappe.local.flags.huf_dx_pin_claims = {}
+
 	def test_an_honest_run_keeps_desktop_origin_on_both_sides(self):
+		self.new_job()
+		# the worker that drains the run claims its pin; the tool handlers of that same job then agree
 		self.assertEqual(self.worker_ctx(self.run1)["origin"], "desktop")
 		self.assertEqual(self.tool_ctx(self.run1)["origin"], "desktop")
+
+	def test_a_web_session_cannot_send_a_finished_desktop_run_back_to_queued(self):
+		"""D1, the exact replay from the review: the same web session (remote control off) sets an
+		earlier desktop run back to Queued. The write is refused, and the run stays as it was."""
+		self.new_job()
+		self.assertEqual(self.worker_ctx(self.run1)["origin"], "desktop")  # the first, honest drain
+		frappe.set_user(self.owner)
+		with self.assertRaises(frappe.PermissionError):
+			frappe.client.set_value("Agent Run", self.run1, "status", "Queued")
+		self.assertEqual(frappe.db.get_value("Agent Run", self.run1, "status"), "Failed")
+		# nor can the other inputs that steer a desktop-origin run be edited
+		for field, value in (("prompt", "steer"), ("agent", "another"), ("conversation", "AC-other")):
+			run = frappe.get_doc("Agent Run", self.run1)
+			run.set(field, value)
+			with self.assertRaises((frappe.PermissionError, frappe.ValidationError)):
+				run.save()
+
+	def test_a_run_that_drains_again_is_remote_even_when_the_requeue_bypasses_the_guard(self):
+		"""Defense in depth: whatever puts the run back in the queue (a bug, a System Manager, a
+		retry after a lost lease), the pin confers desktop origin to ONE execution only."""
+		self.new_job()
+		self.assertEqual(self.worker_ctx(self.run1)["origin"], "desktop")
+		self.assertEqual(self.tool_ctx(self.run1)["origin"], "desktop")
+		frappe.db.set_value("Agent Run", self.run1, "status", "Queued")
+		frappe.db.commit()
+		self.new_job()  # the sweeper's drain job
+		again = self.worker_ctx(self.run1)
+		self.assertEqual(again["origin"], "remote")
+		self.assertNotIn("origin_ip", again)
+		ctx = self.tool_ctx(self.run1)
+		self.assertEqual(ctx["origin"], "remote")
+		frappe.set_user(self.owner)
+		out = dx.dispatch("fs.read", {"path": "a.txt"}, ctx, call_id="c-replay-1", agent_run_id=self.run1)
+		self.assertEqual(out["error"]["code"], "remote_disabled")
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+
+	def test_a_replayed_run_is_a_fresh_remote_decision_against_the_current_agent_flag(self):
+		self.new_job()
+		self.worker_ctx(self.run1)
+		frappe.set_user("Administrator")
+		frappe.db.set_value("Agent", self.agent, "allow_remote_desktop", 1)
+		frappe.db.commit()
+		self.register(remote_control=True)  # the desktop switch is on and so is the agent's
+		frappe.db.set_value("Agent Run", self.run1, "status", "Queued")
+		frappe.db.commit()
+		self.new_job()
+		ctx = self.worker_ctx(self.run1)
+		self.assertEqual(ctx["origin"], "remote")
+		self.assertTrue(ctx["agent_policy"]["allow_remote_desktop"])  # read now, not from the old pin
+		frappe.set_user("Administrator")
+		frappe.db.set_value("Agent", self.agent, "allow_remote_desktop", 0)
+		frappe.db.commit()
+		self.new_job()
+		frappe.db.set_value("Agent Run", self.run1, "status", "Queued")
+		frappe.db.commit()
+		tool = self.tool_ctx(self.run1)
+		self.assertEqual(tool["origin"], "remote")
+		self.assertFalse((tool.get("agent_policy") or {}).get("allow_remote_desktop"))
+		frappe.set_user(self.owner)
+		out = dx.dispatch("fs.read", {"path": "a.txt"}, tool, call_id="c-replay-2", agent_run_id=self.run1)
+		self.assertEqual(out["error"]["code"], "remote_disabled")
+
+	def test_only_one_of_two_racing_drains_claims_the_pin(self):
+		self.new_job()
+		first = dx.claim_desktop_pin(self.run1)
+		second = dx.claim_desktop_pin(self.run1)
+		self.assertTrue(first)
+		self.assertIsNone(second)
+		self.assertEqual(self.pin_of(self.run1)["consumed"], first)
+		# the marker is not part of the signature: the pin still verifies for the run
+		self.assertTrue(self.pin_verifies(self.run1, self.conv))
+		# a run that has no desktop pin cannot be claimed at all
+		self.assertIsNone(dx.claim_desktop_pin("no-such-run"))
+
+	def test_the_normal_run_lifecycle_still_writes_status(self):
+		"""The guard must not break the lifecycle: workers write with db.set_value / db_set and the
+		system context saves; only a client save of a desktop run is refused."""
+		self.new_job()
+		frappe.set_user(self.owner)
+		run = frappe.get_doc("Agent Run", self.run1)
+		run.db_set("status", "Started")  # what _execute_agent_run does
+		frappe.db.set_value("Agent Run", self.run1, {"status": "Failed", "error_message": "x"})  # _fail_queued_run
+		self.assertEqual(frappe.db.get_value("Agent Run", self.run1, "status"), "Failed")
+		frappe.set_user("Administrator")  # the sweeper and any system flow
+		run = frappe.get_doc("Agent Run", self.run1)
+		run.status = "Queued"
+		run.save()
+		self.assertEqual(frappe.db.get_value("Agent Run", self.run1, "status"), "Queued")
+		# a client save that changes nothing guarded is unaffected, on a pinned run too
+		frappe.set_user(self.owner)
+		run = frappe.get_doc("Agent Run", self.run1)
+		run.error_message = "seen by the owner"
+		run.save()
+		# and a run without a desktop pin in a normal conversation is not restricted
+		plain = h.make_run(self.owner, {}, conversation=None)
+		frappe.set_user(self.owner)
+		doc = frappe.get_doc("Agent Run", plain)
+		doc.status = "Queued"
+		doc.save()
+		self.assertEqual(frappe.db.get_value("Agent Run", plain, "status"), "Queued")
+		h.delete_docs([("Agent Run", plain)])
 
 	def test_a_pin_copied_into_a_new_run_is_remote_in_the_worker_and_at_dispatch(self):
 		# the web session reads the pin over REST and inserts a NEW run in the same conversation with it
@@ -1579,6 +1686,101 @@ class TestRunPinBinding(RemoteBase):
 		)
 		self.assertEqual(self.worker_ctx(self.run1)["origin"], "remote")
 		self.assertEqual(self.tool_ctx(self.run1)["origin"], "remote")
+
+
+class TestOriginIp(RemoteBase):
+	"""D13: the client address of a remote run reaches the desktop and the audit log."""
+
+	def setUp(self):
+		super().setUp()
+		self.register(remote_control=True, ws=h.workspace(mode="full"))
+		self.make_agent(allow_remote_desktop=1)
+		self.conv = self.hosted_conversation()
+		self._had_request = getattr(frappe.local, "request", None)
+
+	def tearDown(self):
+		frappe.local.request = self._had_request
+		super().tearDown()
+
+	def as_request(self, remote_addr, forwarded=None):
+		headers = {"X-Forwarded-For": forwarded} if forwarded else {}
+		frappe.local.request = types.SimpleNamespace(remote_addr=remote_addr, headers=headers, path="/", method="POST")
+
+	def test_clean_ip_accepts_only_ip_literals(self):
+		self.assertEqual(dx.clean_ip("203.0.113.7"), "203.0.113.7")
+		self.assertEqual(dx.clean_ip(" 2001:db8::1 "), "2001:db8::1")
+		for junk in ("203.0.113.7, 198.51.100.9", "evil.example.com", "<script>", "", None, "1.2.3", "999.1.1.1"):
+			self.assertEqual(dx.clean_ip(junk), "", repr(junk))
+
+	def test_a_remote_run_carries_the_requests_address_to_the_desktop_and_the_audit(self):
+		self.as_request("203.0.113.7", forwarded="198.51.100.9")  # a spoofed X-Forwarded-For
+		result = self.send(self.conv)
+		self.assertTrue(result["queued"], result)
+		pin = self.pin_of(result["agent_run_id"])
+		self.assertEqual(pin["origin"], "remote")
+		self.assertEqual(pin["origin_ip"], "203.0.113.7")  # the socket peer, never the header
+		self.assertTrue(self.pin_verifies(result["agent_run_id"], self.conv))
+		frappe.set_user("Administrator")
+		row = frappe.get_all(
+			"Desktop Remote Audit",
+			filters={"action": "remote_run", "outcome": "allowed", "device_id": self.device.device_id},
+			fields=["ip_address"],
+		)[-1]
+		self.assertEqual(row.ip_address, "203.0.113.7")
+		# the same run, dispatched by the worker (no request any more), sends it in the call
+		frappe.local.request = None
+		call_id = f"call-rs-{frappe.generate_hash(length=10)}"
+		thread, errors, seen = self.play(
+			call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "ok"}})]
+		)
+		frappe.set_user(self.owner)
+		run_id = result["agent_run_id"]
+		out = dw.handle_read_file(
+			path="a.txt",
+			_dx_executor_id=self.exec_id,
+			_dx_fingerprint=h.FP,
+			_dx_user=self.owner,
+			_dx_pin=dw.issue_pin_token(run_id, self.exec_id, self.owner),
+			agent_run_id=run_id,
+			call_id=call_id,
+		)
+		self.finish(thread, errors)
+		self.assertTrue(out["ok"], out)
+		self.assertEqual(seen[0]["origin"], "remote")
+		self.assertEqual(seen[0]["origin_ip"], "203.0.113.7")
+
+	def test_a_forged_origin_ip_in_the_pin_is_not_trusted_and_a_desktop_call_carries_none(self):
+		self.as_request("203.0.113.7")
+		result = self.send(self.conv)
+		run_id = result["agent_run_id"]
+		context = frappe.parse_json(frappe.db.get_value("Agent Run", run_id, "runtime_context"))
+		context["desktop"]["origin_ip"] = "10.0.0.1"  # unsigned edit: the signature no longer verifies
+		frappe.db.set_value("Agent Run", run_id, "runtime_context", frappe.as_json(context), update_modified=False)
+		frappe.db.commit()
+		frappe.local.request = None
+		frappe.set_user(self.owner)
+		ctx = dw._validate_executor_context(
+			_dx_executor_id=self.exec_id,
+			_dx_fingerprint=h.FP,
+			_dx_user=self.owner,
+			agent_run_id=run_id,
+			_dx_pin=dw.issue_pin_token(run_id, self.exec_id, self.owner),
+		)
+		self.assertNotIn("origin_ip", ctx)
+		self.assertEqual(ctx["origin"], "remote")
+		# a desktop-origin ctx never sends an address, even if one is present
+		call_id = f"call-rs-{frappe.generate_hash(length=10)}"
+		thread, errors, seen = self.play(
+			call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "ok"}})]
+		)
+		frappe.set_user(self.owner)
+		out = dx.dispatch(
+			"fs.read", {"path": "a.txt"}, {**ctx, "origin": "desktop", "origin_ip": "203.0.113.7"}, call_id=call_id
+		)
+		self.finish(thread, errors)
+		self.assertTrue(out["ok"], out)
+		self.assertEqual(seen[0]["origin"], "desktop")
+		self.assertNotIn("origin_ip", seen[0])
 
 
 class TestMissingOriginFailsClosed(RemoteBase):
