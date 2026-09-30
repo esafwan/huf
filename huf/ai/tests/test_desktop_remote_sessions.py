@@ -511,7 +511,13 @@ class TestLeaseSecret(RemoteBase):
 		frappe.set_user(self.owner)
 
 	def dispatch_in_thread(self, results):
-		ctx = {"executor_id": self.exec_id, "fingerprint": h.FP, "user": self.owner, "label": "w"}
+		ctx = {
+			"executor_id": self.exec_id,
+			"fingerprint": h.FP,
+			"user": self.owner,
+			"label": "w",
+			"origin": "desktop",
+		}
 
 		def go():
 			results.append(dx.dispatch("fs.read", {"path": "a.txt"}, ctx, call_id=self.call_id))
@@ -1354,13 +1360,14 @@ class TestAgentDesktopPolicy(RemoteBase):
 		self.assertEqual(self.names(agent), set(TOOLS))
 
 	def test_an_off_capability_removes_its_tools_from_the_model(self):
+		# running a process is running a command: cli=off removes the process tool as well
 		for field, gone in (
-			("desktop_access_cli", "desktop_run_command"),
-			("desktop_access_files", "desktop_read_file"),
-			("desktop_access_processes", "desktop_process_start"),
+			("desktop_access_cli", {"desktop_run_command", "desktop_process_start"}),
+			("desktop_access_files", {"desktop_read_file"}),
+			("desktop_access_processes", {"desktop_process_start"}),
 		):
 			agent = self.make_agent(**{field: "off"})
-			self.assertEqual(self.names(agent), set(TOOLS) - {gone}, field)
+			self.assertEqual(self.names(agent), set(TOOLS) - gone, field)
 
 	def test_ask_still_exposes_the_tool_and_is_carried_to_the_desktop(self):
 		agent = self.make_agent(desktop_access_cli="ask")
@@ -1371,7 +1378,9 @@ class TestAgentDesktopPolicy(RemoteBase):
 		agent = self.make_agent()  # everything allowed on the document
 		pinned = dp.default_policy()
 		pinned["cli"] = "off"
-		self.assertEqual(self.names(agent, {"agent_policy": pinned}), set(TOOLS) - {"desktop_run_command"})
+		self.assertEqual(
+			self.names(agent, {"agent_policy": pinned}), set(TOOLS) - {"desktop_run_command", "desktop_process_start"}
+		)
 
 	def test_the_run_pin_carries_the_effective_policy_and_it_is_signed(self):
 		agent = self.make_agent(
@@ -1580,6 +1589,7 @@ class TestMissingOriginFailsClosed(RemoteBase):
 		super().setUp()
 		self.register(remote_control=False)
 		self.make_agent()
+		frappe.set_user(self.owner)
 
 	def ctx(self, **extra):
 		ctx = {"executor_id": self.exec_id, "fingerprint": h.FP, "user": self.owner, "label": "w"}
@@ -1613,7 +1623,7 @@ class TestPolicyCeilingHoles(RemoteBase):
 
 	def setUp(self):
 		super().setUp()
-		self.register(remote_control=True)
+		self.register(remote_control=True, caps=CAPS + ["skills.exec"])
 		frappe.set_user(self.owner)
 
 	def ctx(self, policy):
@@ -1820,7 +1830,8 @@ class TestRealtimeDoesNotLeakPayloads(RemoteBase):
 			"origin": "desktop",
 		}
 		with mock.patch("frappe.publish_realtime") as publish, mock.patch.object(dx, "ACK_TIMEOUT_S", 1):
-			dx.dispatch("fs.read", {"path": "secret/plans.txt"}, ctx, call_id="c-leak-1")
+			out = dx.dispatch("fs.read", {"path": "secret/plans.txt"}, ctx, call_id="c-leak-1")
+		self.assertEqual(out["error"]["code"], "desktop_unreachable", out)
 		calls = [c for c in publish.call_args_list if c.kwargs.get("event") == dx.TOOL_CALL_EVENT]
 		self.assertEqual(len(calls), 1)
 		return calls[0].kwargs["message"]
