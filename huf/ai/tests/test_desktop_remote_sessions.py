@@ -1830,7 +1830,7 @@ class TestRealtimeDoesNotLeakPayloads(RemoteBase):
 			"origin": "desktop",
 		}
 		with mock.patch("frappe.publish_realtime") as publish, mock.patch.object(dx, "ACK_TIMEOUT_S", 1):
-			out = dx.dispatch("fs.read", {"path": "secret/plans.txt"}, ctx, call_id="c-leak-1")
+			out = dx.dispatch("fs.read", {"path": "secret/plans.txt"}, ctx, call_id=f"c-leak-{frappe.generate_hash(length=8)}")
 		self.assertEqual(out["error"]["code"], "desktop_unreachable", out)
 		calls = [c for c in publish.call_args_list if c.kwargs.get("event") == dx.TOOL_CALL_EVENT]
 		self.assertEqual(len(calls), 1)

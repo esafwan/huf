@@ -440,7 +440,7 @@ class TestMcpDispatch(sup.LocalBase):
 		self.nothing_was_published()
 
 	def test_l28_dispatch_refuses_non_curated_browser_tools_even_when_sent_directly(self):
-		ctx = {"executor_id": self.exec_id, "fingerprint": sup.h.FP, "user": self.user, "label": "w", "catalog_hash": self.cat}
+		ctx = {"executor_id": self.exec_id, "fingerprint": sup.h.FP, "user": self.user, "label": "w", "origin": "desktop", "catalog_hash": self.cat}
 		for tool_name in BROWSER_EXCLUDED:
 			out = dx.dispatch(
 				"mcp.call", {"server": "browser", "tool": tool_name, "arguments": {}}, ctx,
@@ -450,7 +450,7 @@ class TestMcpDispatch(sup.LocalBase):
 		self.nothing_was_published()
 
 	def test_a_curated_browser_call_passes_dispatch_and_is_untrusted(self):
-		ctx = {"executor_id": self.exec_id, "fingerprint": sup.h.FP, "user": self.user, "label": "w", "catalog_hash": self.cat}
+		ctx = {"executor_id": self.exec_id, "fingerprint": sup.h.FP, "user": self.user, "label": "w", "origin": "desktop", "catalog_hash": self.cat}
 		thread, errors, seen = self.play(self.run, self.ok({"content": [{"type": "text", "text": "page"}]}))
 		out = dx.dispatch(
 			"mcp.call",
@@ -466,7 +466,7 @@ class TestMcpDispatch(sup.LocalBase):
 	def test_the_browser_being_switched_off_locally_makes_its_tools_unavailable(self):
 		off = self.publish(catalog(mcp=[docs_server(), browser_server()], browser=False))["catalog_hash"]
 		run = self.make_run(off)
-		ctx = {"executor_id": self.exec_id, "fingerprint": sup.h.FP, "user": self.user, "label": "w", "catalog_hash": off}
+		ctx = {"executor_id": self.exec_id, "fingerprint": sup.h.FP, "user": self.user, "label": "w", "origin": "desktop", "catalog_hash": off}
 		out = dx.dispatch(
 			"mcp.call", {"server": "browser", "tool": "browser_navigate", "arguments": {}}, ctx,
 			call_id="call-off-direct", agent_run_id=run, agent_name="a",

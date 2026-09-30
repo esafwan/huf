@@ -225,7 +225,8 @@ class DesktopExecutorTestCase(unittest.TestCase):
 		)
 
 	def ctx(self, user=USER):
-		return {"executor_id": EXEC_ID, "fingerprint": FP, "user": user, "label": "my-project"}
+		# a call the server dispatches for a desktop-origin run; a ctx with no origin is REMOTE (fail closed)
+		return {"executor_id": EXEC_ID, "fingerprint": FP, "user": user, "label": "my-project", "origin": "desktop"}
 
 	def desktop_submit(self, call_id, kind, payload=None, user=USER, executor_id=EXEC_ID):
 		self.session.user = user
