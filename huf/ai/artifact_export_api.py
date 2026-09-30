@@ -24,7 +24,16 @@ from huf.ai.artifacts.render.html import render_document_html
 from huf.ai.artifacts.render.pdf import html_to_pdf
 
 #: Supported export formats and how to turn rendered HTML into file bytes.
-_FORMATS = ("pdf", "docx", "html")
+#: "md" is the artifact's own markdown source, delivered unrendered.
+_FORMATS = ("pdf", "docx", "html", "md")
+
+#: Content types for the formats above (used by the stateless content export).
+_MIME_TYPES = {
+	"pdf": "application/pdf",
+	"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"html": "text/html; charset=utf-8",
+	"md": "text/markdown; charset=utf-8",
+}
 
 #: Artifact types whose content is markdown source the render pipeline can consume.
 _EXPORTABLE_ARTIFACT_TYPES = ("document", "markdown")
@@ -143,14 +152,9 @@ def export_artifact(name: str, format: str) -> dict:
 			frappe.ValidationError,
 		)
 
-	html = _render_artifact_html(artifact)
-
-	if format == "html":
-		rendered_bytes = html.encode("utf-8")
-	elif format == "pdf":
-		rendered_bytes = html_to_pdf(html)
-	else:
-		rendered_bytes = html_to_docx(html)
+	rendered_bytes = _render_bytes(
+		artifact.content, artifact.title or artifact.name, _normalize_language(artifact.language), format
+	)
 
 	_delete_existing_export(name, format)
 
@@ -168,6 +172,59 @@ def export_artifact(name: str, format: str) -> dict:
 	frappe.db.commit()
 
 	return {"file_url": file_doc.file_url, "format": format}
+
+
+def _render_bytes(content: str, title: str, language: str, format: str) -> bytes:
+	"""Turn document source into the bytes of one export format."""
+	if format == "md":
+		return (content or "").encode("utf-8")
+	html = render_document_html(content, title=title, language=language)
+	if format == "html":
+		return html.encode("utf-8")
+	if format == "pdf":
+		return html_to_pdf(html)
+	return html_to_docx(html)
+
+
+def export_filename(title: str, format: str) -> str:
+	"""A safe download file name: title reduced to [A-Za-z0-9 _-], extension forced."""
+	import re
+
+	stem = re.sub(r"[^A-Za-z0-9 _-]+", "", title or "").strip().strip(".")[:80].strip() or "document"
+	return f"{stem}.{format}"
+
+
+@frappe.whitelist(methods=["POST"])
+def export_document_content(content: str, format: str, language: str = "markdown", title: str = "") -> dict:
+	"""Render UNSAVED document content straight to a PDF/DOCX/HTML/Markdown file.
+
+	Backs the Export menu on an inline chat card whose artifact was parsed from a
+	message and has no Artifact row (so ``export_artifact`` has nothing to name).
+	Stateless like ``preview_document_html``: writes no File row, returns the bytes
+	base64-encoded so the client can save them without a second authenticated fetch.
+	"""
+	import base64
+
+	if not content:
+		frappe.throw(_("Content is required"), frappe.ValidationError)
+	if format not in _FORMATS:
+		frappe.throw(
+			_("Unsupported export format: {0}. Must be one of {1}.").format(format, ", ".join(_FORMATS)),
+			frappe.ValidationError,
+		)
+	if len(content.encode("utf-8")) > _MAX_PREVIEW_CONTENT_BYTES:
+		frappe.throw(
+			_("Content is too large to export ({0} KB limit).").format(_MAX_PREVIEW_CONTENT_BYTES // 1000),
+			frappe.ValidationError,
+		)
+
+	data = _render_bytes(content, title or _("Untitled document"), _normalize_language(language), format)
+	return {
+		"format": format,
+		"file_name": export_filename(title, format),
+		"mime_type": _MIME_TYPES[format],
+		"content_base64": base64.b64encode(data).decode("ascii"),
+	}
 
 
 def _delete_existing_export(artifact_name: str, format: str) -> None:

@@ -2119,14 +2119,34 @@ DOCUMENT_ARTIFACT_TOOLS = [
 		"tool_name": "export_artifact",
 		"description": (
 			"Export a document artifact (created via <artifact type=\"document\">) as a "
-			"downloadable PDF, DOCX, or HTML file. Only artifacts of type 'document' or "
+			"downloadable PDF, DOCX, HTML or Markdown file. Only artifacts of type 'document' or "
 			"'markdown' can be exported - their content is treated as markdown source."
 		),
 		"function_path": "huf.ai.tools.document_artifact.handle_export_artifact",
 		"category": "Document Tools",
 		"parameters": [
 			_p("artifact_id", required=True, description="The id/name of the Artifact to export"),
-			_p("format", required=True, description="One of 'pdf', 'docx', 'html'"),
+			_p("format", required=True, description="One of 'pdf', 'docx', 'html', 'md'"),
+		],
+	},
+	{
+		"tool_name": "export_document",
+		"description": (
+			"Produce a downloadable PDF, DOCX, HTML or Markdown file from a document, and return a "
+			"ready-made download link. Use this whenever the user asks for a PDF or Word file "
+			"('make this a PDF', 'create a docx report') instead of pasting the text. Either pass the "
+			"document text as 'content' (works in the same turn, no artifact needed) or name an "
+			"existing document with 'artifact_id_or_title' (an artifact id, or its title). "
+			"Relay the returned 'markdown_link' verbatim in your reply."
+		),
+		"function_path": "huf.ai.tools.document_artifact.handle_export_document",
+		"category": "Document Tools",
+		"parameters": [
+			_p("format", required=True, description="One of 'pdf', 'docx', 'html', 'md'"),
+			_p("content", description="The document text (markdown, or HTML when language='html'). Use this to create a file from new text"),
+			_p("artifact_id_or_title", description="An existing document artifact's id, or its title (or part of it). Use this to export a document from earlier in the conversation"),
+			_p("title", description="Title used for the file name and document heading when 'content' is given"),
+			_p("language", description="'markdown' (default) or 'html' for designed documents"),
 		],
 	},
 	{

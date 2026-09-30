@@ -32,7 +32,7 @@ import frappe
 
 # Tool names that mark an agent as document-capable. Matches the exact
 # tool_name values registered in huf.ai.tools._registry.DOCUMENT_ARTIFACT_TOOLS.
-DOCUMENT_TOOL_NAME = re.compile(r"export_artifact|redline_artifact|list_document_artifacts|show_artifact", re.IGNORECASE)
+DOCUMENT_TOOL_NAME = re.compile(r"export_artifact|export_document|redline_artifact|list_document_artifacts|show_artifact", re.IGNORECASE)
 
 
 def agent_has_document_tools(agent_doc) -> bool:
@@ -207,12 +207,25 @@ in either format - prefer them whenever the user may want the Word file.
 
 ### Downloading
 
-If the user just asks to download the document as PDF or DOCX, the download
-buttons on the artifact already do this - a working file is produced from
+If the user just asks to download the document as PDF or DOCX, the Export
+menu on the artifact already does this - a working file is produced from
 the artifact once it is saved.
 """
 
 DOCUMENT_EXPORT_TOOL_INSTRUCTIONS = """
+### Producing a PDF or Word file when asked - use `export_document`
+
+If the user asks for a PDF, a Word/DOCX file, or "a report as a document"
+("make this a PDF", "create a docx report"), call
+`export_document(format, content=...)` (or `artifact_id_or_title=...` for a
+document already in the conversation). It renders through the platform
+pipeline and returns a `markdown_link`; put that link in your reply so the
+user gets a download. Do NOT paste the document as plain text, and do NOT
+write a script that builds the file - neither produces a download. `format`
+is one of `pdf`, `docx`, `html`, `md`. Only when the tool is not available to
+you, emit `<artifact type="document">` instead; its Export menu offers PDF
+and DOCX.
+
 ### Exporting and redlining via tools - id sequencing matters
 
 You also have `list_document_artifacts`, `export_artifact`, `redline_artifact`,
@@ -233,7 +246,7 @@ To export or redline a document created earlier in the conversation (by you
 or by a previous turn):
 1. Call `list_document_artifacts(conversation_id)` first to find its id.
 2. Call `export_artifact(artifact_id, format)` with `format` one of `"pdf"`,
-   `"docx"`, `"html"` - returns a downloadable file URL.
+   `"docx"`, `"html"`, `"md"` - returns a downloadable file URL.
 3. To suggest edits as Word tracked changes, call
    `redline_artifact(artifact_id, edits, author)` with `edits` as a list of
    `{"find": "...", "replace": "..."}` objects. This produces a NEW derived
