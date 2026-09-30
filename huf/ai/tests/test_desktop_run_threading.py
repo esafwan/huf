@@ -196,6 +196,10 @@ class TestRunAgentSyncThreading(unittest.TestCase):
 		self.conversation.name = "CONV-1"
 		self.run_doc = MagicMock()
 		self.run_doc.name = "AR-1"
+		self.run_doc.conversation = "CONV-1"
+		self.run_doc.agent = "A"
+		self.run_doc.prompt = "hi"
+		self.run_doc.creation = "2026-09-30 10:00:00.000000"
 		self.conv_manager = MagicMock()
 		self.conv_manager.session_id = "s"
 		self.conv_manager.get_or_create_conversation.return_value = self.conversation
@@ -219,6 +223,13 @@ class TestRunAgentSyncThreading(unittest.TestCase):
 		mock_frappe.as_json.side_effect = json.dumps
 		mock_cm_cls.return_value = self.conv_manager
 		return ai.run_agent_sync(agent_name="A", prompt="hi", **kw)
+
+	def _signed_pin(self, mock_frappe):
+		"""The pin as stored after the insert: signed, bound to the run that now exists."""
+		for c in mock_frappe.db.set_value.call_args_list:
+			if c.args[:3] == ("Agent Run", "AR-1", "runtime_context"):
+				return json.loads(c.args[3])["desktop"]
+		self.fail("the run pin was never signed after the insert")
 
 	def _persisted_context(self, mock_frappe):
 		data = mock_frappe.get_doc.call_args_list
@@ -250,12 +261,14 @@ class TestRunAgentSyncThreading(unittest.TestCase):
 		result = self._run(f, cm, desktop_executor_id="exec-1")
 		self.assertTrue(result["queued"])
 		execute.assert_not_called()
-		ctx = self._persisted_context(f)
-		pin = ctx["desktop"]
+		# written unsigned by the insert (the run has no name yet) ...
+		self.assertNotIn("sig", self._persisted_context(f)["desktop"])
+		# ... and signed right after it, for THIS conversation and THIS run
+		pin = self._signed_pin(f)
 		self.assertEqual({k: pin[k] for k in CTX}, CTX)
 		self.assertEqual(pin["origin"], "desktop")
-		# signed for THIS conversation, so the worker can trust origin and policy
-		self.assertTrue(dx.verify_pin(pin, "CONV-1"))
+		self.assertTrue(dx.verify_pin(pin, "CONV-1", self.run_doc))
+		self.assertFalse(dx.verify_pin(pin, "CONV-1", MagicMock(name="another run")))
 		self.assertTrue(result["desktop_tools"]["available"])
 
 	@patch("huf.ai.agent_integration._execute_agent_run")

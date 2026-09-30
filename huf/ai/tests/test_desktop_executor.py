@@ -269,6 +269,8 @@ class TestLease(DesktopExecutorTestCase):
 					"device": True,
 					"control": True,
 					"lease_secret": True,
+					"opaque_realtime": True,
+					"control_nonce": True,
 				},
 			},
 		)
