@@ -37,16 +37,24 @@ REMOTE_DISABLED_MESSAGE = {
 
 
 def audit(
-	action, outcome, user=None, device_id=None, origin=None, conversation=None, agent=None, detail=None
+	action,
+	outcome,
+	user=None,
+	device_id=None,
+	origin=None,
+	conversation=None,
+	agent=None,
+	detail=None,
+	ip=None,
 ):
 	"""Append one ``Desktop Remote Audit`` row. Never raises: an audit failure must not change the
 	outcome of the action it describes."""
 	try:
-		ip = None
-		try:
-			ip = frappe.local.request_ip
-		except Exception:
-			ip = None
+		if ip is None:
+			try:
+				ip = frappe.local.request_ip
+			except Exception:
+				ip = None
 		frappe.get_doc(
 			{
 				"doctype": "Desktop Remote Audit",
@@ -181,6 +189,7 @@ def resolve_hosted_run(conversation, agent_doc, desktop_lease_secret=None):
 
 	policy = desktop_policy.policy_from_agent(agent_doc)
 	origin = "desktop" if dx.secret_matches(lease, dx.presented_secret(desktop_lease_secret)) else "remote"
+	origin_ip = dx.request_origin_ip() if origin == "remote" else ""
 	if origin == "remote":
 		off = remote_gate(lease, policy)
 		if off:
@@ -208,6 +217,7 @@ def resolve_hosted_run(conversation, agent_doc, desktop_lease_secret=None):
 			origin="remote",
 			conversation=conversation.name,
 			agent=conversation.agent,
+			ip=origin_ip or None,
 		)
 	ctx = dx.resolve_desktop_ctx(lease["executor_id"], user=user)
 	if not ctx:
@@ -218,6 +228,8 @@ def resolve_hosted_run(conversation, agent_doc, desktop_lease_secret=None):
 		)
 	ctx["origin"] = origin
 	ctx["agent_policy"] = policy
+	if origin_ip:
+		ctx["origin_ip"] = origin_ip
 	return ctx, {"available": True, "reason": None}, None
 
 

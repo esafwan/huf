@@ -2143,6 +2143,9 @@ def dispatch(
 				"approval_timeout_ms": APPROVAL_TIMEOUT_MS,
 				"origin": origin,
 			}
+			origin_ip = clean_ip(ctx.get("origin_ip")) if origin == "remote" else ""
+			if origin_ip:
+				request["origin_ip"] = origin_ip
 			if policy:
 				request["agent_policy"] = policy
 			if lease.get("device_id"):
@@ -2390,6 +2393,7 @@ PIN_SIGNED_FIELDS = (
 	"origin",
 	"device_id",
 	"agent_policy",
+	"origin_ip",
 )
 
 
@@ -2478,6 +2482,105 @@ def verify_pin(pin, conversation_id=None, run=None):
 		return hmac.compare_digest(sig, sign_pin(pin, conversation_id, run))
 	except Exception:
 		return False
+
+
+# --------------------------------------------------------------------------
+# Single-use desktop origin (a pin confers desktop origin to ONE execution of a run)
+# --------------------------------------------------------------------------
+
+
+def claim_desktop_pin(run_name):
+	"""Atomically consume the desktop-origin pin of ``run_name``: returns a claim token to the first
+	caller and ``None`` to every later one.
+
+	The pin's signature binds the run's name, conversation, agent, creation time and prompt, but not
+	its status, so a client that sets a finished run back to ``Queued`` gets it drained again with a
+	pin that still verifies. Desktop origin is therefore honoured for one execution only: the first
+	claim writes ``consumed`` into the run's pin under a row lock (``SELECT ... FOR UPDATE``) and
+	commits, so two drains racing for the same run cannot both win and the marker survives a failed
+	execution. ``consumed`` is deliberately outside the signed fields: it is server state, and only a
+	System Manager or the server itself can write ``runtime_context`` of an existing run. Any later
+	execution of the same run is REMOTE and goes through the normal remote gate.
+
+	The token is remembered in ``frappe.local.flags`` for this job or request, which is how the tool
+	handlers (:func:`holds_pin_claim`) tell the execution that claimed the pin from a replay.
+	"""
+	if not run_name:
+		return None
+	try:
+		rows = frappe.db.sql(
+			"select runtime_context from `tabAgent Run` where name=%s for update", (run_name,)
+		)
+		if not rows:
+			return None
+		raw = rows[0][0]
+		context = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+		pin = context.get("desktop") if isinstance(context, dict) else None
+		if not isinstance(pin, dict) or pin.get("consumed"):
+			return None
+		token = secrets.token_hex(8)
+		pin["consumed"] = token
+		frappe.db.sql(
+			"update `tabAgent Run` set runtime_context=%s where name=%s",
+			(json.dumps(context, sort_keys=True, default=str), run_name),
+		)
+		frappe.db.commit()
+	except Exception:
+		_log_failure("desktop_executor: pin claim failed")
+		return None
+	claims = getattr(frappe.local.flags, "huf_dx_pin_claims", None)
+	if not isinstance(claims, dict):
+		claims = {}
+		frappe.local.flags.huf_dx_pin_claims = claims
+	claims[run_name] = token
+	return token
+
+
+def holds_pin_claim(pin, run_name):
+	"""True when THIS execution claimed the run's desktop pin (see :func:`claim_desktop_pin`)."""
+	token = (pin or {}).get("consumed")
+	claims = getattr(frappe.local.flags, "huf_dx_pin_claims", None)
+	return bool(token and isinstance(claims, dict) and claims.get(run_name) == token)
+
+
+def replay_policy(agent_name):
+	"""The agent's CURRENT desktop policy for a run that is executed again: a fresh server decision
+	(the agent's ``allow_remote_desktop`` flag as it is now), never the policy the run was pinned
+	with. ``None`` when the agent cannot be read."""
+	try:
+		return desktop_policy.policy_from_agent(frappe.get_doc("Agent", agent_name))
+	except Exception:
+		return None
+
+
+# --------------------------------------------------------------------------
+# Client IP of the request that started a remote run
+# --------------------------------------------------------------------------
+
+
+def clean_ip(value):
+	"""The canonical text of an IP literal, or ``""``. Anything else (a hostname, a list, text with
+	a comment) is dropped, so the value that reaches the desktop is always safe to display."""
+	import ipaddress
+
+	try:
+		return str(ipaddress.ip_address(str(value).strip()))
+	except Exception:
+		return ""
+
+
+def request_origin_ip():
+	"""The connecting address of the current web request, or ``""`` outside one.
+
+	This is ``request.remote_addr`` and NOT ``frappe.local.request_ip``: Frappe derives the latter
+	from ``X-Forwarded-For`` unconditionally, which any client can set. ``remote_addr`` is the socket
+	peer, and is the forwarded client only when the site is configured with Frappe's trusted proxy
+	handling (``ProxyFix``, ``bench serve --proxy``)."""
+	try:
+		req = getattr(frappe.local, "request", None)
+		return clean_ip(getattr(req, "remote_addr", None)) if req is not None else ""
+	except Exception:
+		return ""
 
 
 # --------------------------------------------------------------------------

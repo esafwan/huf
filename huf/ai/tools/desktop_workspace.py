@@ -238,6 +238,21 @@ def _validate_executor_context(
 			ctx["agent_policy"] = desktop_ctx["agent_policy"]
 		if desktop_ctx.get("device_id"):
 			ctx["device_id"] = desktop_ctx["device_id"]
+		if desktop_ctx.get("origin_ip"):
+			ctx["origin_ip"] = desktop_ctx["origin_ip"]
+		if ctx["origin"] == "desktop":
+			# Desktop origin is single-use: only the execution that claimed the pin keeps it. Any
+			# other execution of this run (re-queued, drained again) is remote against the agent's
+			# policy as it is now.
+			from huf.ai.desktop_executor import holds_pin_claim, replay_policy
+
+			if not holds_pin_claim(desktop_ctx, run.name):
+				ctx["origin"] = "remote"
+				ctx.pop("origin_ip", None)
+				ctx.pop("agent_policy", None)
+				policy = replay_policy(run.get("agent"))
+				if policy:
+					ctx["agent_policy"] = policy
 	else:
 		ctx["origin"] = "remote"
 	return ctx

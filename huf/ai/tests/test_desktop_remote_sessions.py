@@ -1697,14 +1697,18 @@ class TestOriginIp(RemoteBase):
 		self.make_agent(allow_remote_desktop=1)
 		self.conv = self.hosted_conversation()
 		self._had_request = getattr(frappe.local, "request", None)
+		self._had_ip = getattr(frappe.local, "request_ip", None)
 
 	def tearDown(self):
 		frappe.local.request = self._had_request
+		frappe.local.request_ip = self._had_ip
 		super().tearDown()
 
 	def as_request(self, remote_addr, forwarded=None):
 		headers = {"X-Forwarded-For": forwarded} if forwarded else {}
 		frappe.local.request = types.SimpleNamespace(remote_addr=remote_addr, headers=headers, path="/", method="POST")
+		# what Frappe itself derives (it trusts X-Forwarded-For): the value the huf code must NOT use
+		frappe.local.request_ip = forwarded or remote_addr
 
 	def test_clean_ip_accepts_only_ip_literals(self):
 		self.assertEqual(dx.clean_ip("203.0.113.7"), "203.0.113.7")

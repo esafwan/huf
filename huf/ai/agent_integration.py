@@ -1156,6 +1156,13 @@ def _link_preexisting_user_message(conversation_name: str, run_name: str):
 		frappe.db.set_value("Agent Message", msg_name, "agent_run", run_name, update_modified=False)
 
 
+def desktop_executor_origin_ip():
+    """IP literal of the request that starts a remote-origin run (see ``request_origin_ip``)."""
+    from huf.ai.desktop_executor import request_origin_ip
+
+    return request_origin_ip()
+
+
 def _resolve_desktop_request(desktop_executor_id, desktop_lease_secret=None, agent_doc=None):
     """Resolve an optional ``desktop_executor_id`` once, at run start (a conversation that is NOT
     desktop-hosted; see :func:`_resolve_desktop_for_run` for the hosted case).
@@ -1182,12 +1189,24 @@ def _resolve_desktop_request(desktop_executor_id, desktop_lease_secret=None, age
             policy = desktop_policy.policy_from_agent(agent_doc)
             ctx = {**ctx, "origin": origin, "agent_policy": policy}
             if origin == "remote":
+                origin_ip = desktop_executor_origin_ip()
+                if origin_ip:
+                    ctx["origin_ip"] = origin_ip
                 gate = desktop_sessions.remote_gate(
                     {"remote_control": lease_remote_control(desktop_executor_id)}, policy
                 )
                 if gate:
                     frappe.logger("huf").warning(f"Ignoring desktop_executor_id: remote control off ({gate})")
                     return None, {"available": False, "reason": "remote_disabled"}
+                desktop_sessions.audit(
+                    "remote_run",
+                    "allowed",
+                    user=frappe.session.user,
+                    device_id=ctx.get("device_id"),
+                    origin="remote",
+                    agent=getattr(agent_doc, "name", None),
+                    ip=ctx.get("origin_ip") or None,
+                )
     except Exception as exc:  # never break the chat over an optional feature
         frappe.logger("huf").warning(f"desktop executor resolution failed: {exc!s}")
         ctx = None
@@ -1244,6 +1263,8 @@ def _desktop_runtime_context(desktop_ctx, conversation_id=None, run=None, sign=T
         pin["device_id"] = desktop_ctx["device_id"]
     if desktop_ctx.get("agent_policy"):
         pin["agent_policy"] = desktop_ctx["agent_policy"]
+    if desktop_ctx.get("origin") == "remote" and desktop_ctx.get("origin_ip"):
+        pin["origin_ip"] = desktop_ctx["origin_ip"]
     if sign:
         pin["sig"] = sign_pin(pin, conversation_id, run)
     return pin
@@ -1324,9 +1345,24 @@ def _desktop_ctx_from_runtime_context(
         resolved["origin"] = pinned.get("origin") if pinned.get("origin") in ("desktop", "remote") else "remote"
         if pinned.get("agent_policy"):
             resolved["agent_policy"] = pinned["agent_policy"]
+        if pinned.get("origin_ip"):
+            resolved["origin_ip"] = pinned["origin_ip"]
         if pinned.get("device_id") and live.get("device_id") != pinned["device_id"]:
             frappe.logger("huf").warning("Dropping desktop pin: the executor now belongs to another device")
             return None
+        if resolved["origin"] == "desktop":
+            # Desktop origin is single-use: only the execution that claims the pin gets it. A run
+            # that is executed again (re-queued by a client, or drained again after a lost lease) is
+            # a fresh server decision, REMOTE, against the agent's current policy.
+            from huf.ai.desktop_executor import claim_desktop_pin, replay_policy
+
+            if not claim_desktop_pin(run.get("name") if isinstance(run, dict) else run.name):
+                frappe.logger("huf").warning("Desktop pin already used: run is executed again as remote")
+                resolved["origin"] = "remote"
+                resolved["agent_policy"] = replay_policy(run.get("agent") if isinstance(run, dict) else run.agent)
+                if not resolved["agent_policy"]:
+                    resolved.pop("agent_policy")
+                resolved.pop("origin_ip", None)
     else:
         resolved["origin"] = "remote"
         resolved.pop("agent_policy", None)
@@ -1656,6 +1692,14 @@ def run_agent_sync(
             "session_id": conv_manager.session_id,
             "sequence": sequence,
         }, desktop_status)
+
+    if desktop_ctx and desktop_ctx.get("origin") == "desktop":
+        # This request executes the run itself, so it is the one execution allowed to use the
+        # pin's desktop origin. Claimed now, a client that sets the run back to Queued afterwards
+        # gets it drained as remote.
+        from huf.ai.desktop_executor import claim_desktop_pin
+
+        claim_desktop_pin(run_doc.name)
 
     # Direct path (``now`` override or Agent.run_immediately): preserve the
     # existing immediate behavior — persist the user message up front and
