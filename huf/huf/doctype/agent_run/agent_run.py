@@ -9,8 +9,32 @@ import re
 
 class AgentRun(Document):
 	def validate(self):
+		self.guard_runtime_context()
 		self.extract_reference_from_prompt()
 		self.validate_reference()
+
+	def guard_runtime_context(self):
+		"""``runtime_context`` holds the signed desktop pin (origin, policy, device). It is server
+		state: a client (REST ``set_value`` or a document save by a Huf User) may not rewrite it on an
+		existing run. The server's own writes use ``db.set_value`` or run as Administrator."""
+		if self.is_new() or frappe.flags.in_install or frappe.flags.in_migrate:
+			return
+		if frappe.session.user == "Administrator" or "System Manager" in frappe.get_roles():
+			return
+		before = self.get_doc_before_save()
+		if before is None:
+			return
+
+		def norm(value):
+			if isinstance(value, str):
+				try:
+					return frappe.parse_json(value)
+				except Exception:
+					return value
+			return value
+
+		if norm(before.get("runtime_context")) != norm(self.get("runtime_context")):
+			frappe.throw(_("runtime_context of an Agent Run is managed by the server."), frappe.PermissionError)
 
 	def extract_reference_from_prompt(self):
 		if not self.reference_doctype or not self.reference_name:

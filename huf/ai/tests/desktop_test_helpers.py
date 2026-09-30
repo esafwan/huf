@@ -77,18 +77,14 @@ def delete_docs(pairs):
 	frappe.db.commit()
 
 
-def make_run(user, runtime_context, resign=True):
+def make_run(user, runtime_context, resign=True, conversation=None):
 	"""Insert a real Agent Run owned by ``user`` whose runtime_context is a JSON STRING
 	(as ``run_agent_sync`` stores it). Returns the run name.
 
-	``resign`` (default) signs the desktop pin the way ``run_agent_sync`` does, so tests that edit a
-	pin dict before inserting it model a pin the server wrote. ``resign=False`` inserts it as given:
-	that is how a forged pin (a Huf User writing ``runtime_context`` directly) is modelled."""
-	if resign and isinstance((runtime_context or {}).get("desktop"), dict):
-		runtime_context = dict(runtime_context)
-		pin = dict(runtime_context["desktop"])
-		pin["sig"] = dx.sign_pin(pin, None)
-		runtime_context["desktop"] = pin
+	``resign`` (default) signs the desktop pin the way ``run_agent_sync`` does: AFTER the insert, bound
+	to the run that now exists (its name, conversation, agent, creation and prompt). So tests that
+	edit a pin dict before inserting it model a pin the server wrote. ``resign=False`` inserts it as
+	given: that is how a forged pin (a Huf User writing ``runtime_context`` directly) is modelled."""
 	frappe.set_user(user)
 	run = frappe.get_doc(
 		{
@@ -96,9 +92,18 @@ def make_run(user, runtime_context, resign=True):
 			"status": "Started",
 			"prompt": "desktop tool test",
 			"runtime_context": frappe.as_json(runtime_context),
+			**({"conversation": conversation} if conversation else {}),
 		}
 	)
 	run.insert(ignore_permissions=True)
+	if resign and isinstance((runtime_context or {}).get("desktop"), dict):
+		runtime_context = dict(runtime_context)
+		pin = dict(runtime_context["desktop"])
+		pin["sig"] = dx.sign_pin(pin, run.conversation, run)
+		runtime_context["desktop"] = pin
+		frappe.db.set_value(
+			"Agent Run", run.name, "runtime_context", frappe.as_json(runtime_context), update_modified=False
+		)
 	frappe.db.commit()
 	return run.name
 

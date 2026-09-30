@@ -325,7 +325,7 @@ def set_desktop_permission_mode(device_id=None, mode=None):
 
 
 @frappe.whitelist(methods=["POST"])
-def rebind_desktop_conversation(conversation=None, workspace_fingerprint=None):
+def rebind_desktop_conversation(conversation=None, workspace_fingerprint=None, desktop_lease_secret=None):
 	"""Move a desktop-hosted conversation to the workspace its device has open now.
 
 	Only the owner can rebind, only within the same device (the device id never changes), only while
@@ -350,6 +350,17 @@ def rebind_desktop_conversation(conversation=None, workspace_fingerprint=None):
 			"The desktop is offline.",
 			last_seen=dx.device_last_seen(user, conv.host_device_id),
 		)
+	origin = dx.origin_for(lease.get("executor_id"), desktop_lease_secret, user=user)
+	if origin == "remote" and not lease.get("remote_control"):
+		audit(
+			"rebind",
+			"remote_disabled",
+			user=user,
+			device_id=conv.host_device_id,
+			origin="remote",
+			conversation=conversation,
+		)
+		return _fail("remote_disabled", REMOTE_DISABLED_MESSAGE["desktop"])
 	ws = lease.get("workspace") or {}
 	current = ws.get("fingerprint")
 	if workspace_fingerprint and workspace_fingerprint != current:
@@ -370,7 +381,7 @@ def rebind_desktop_conversation(conversation=None, workspace_fingerprint=None):
 		"applied",
 		user=user,
 		device_id=conv.host_device_id,
-		origin="remote",
+		origin=origin,
 		conversation=conversation,
 		detail=f"{conv.host_workspace_fingerprint} -> {current}",
 	)

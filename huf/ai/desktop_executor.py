@@ -125,6 +125,7 @@ only Redis and ``publish_realtime``; it never reads the database and logs throug
 """
 
 import base64
+import datetime
 import hashlib
 import hmac
 import json
@@ -266,7 +267,8 @@ SKILL_TRUST_NOTE = (
 SKILL_MD_PATH = "SKILL.md"
 # Where a run came from, decided by the SERVER and carried in every dispatched call. A remote
 # session that the user enabled (per agent or globally) behaves exactly like a desktop-originated
-# run: no extra cap and no extra prompting. Anything other than "remote" is "desktop".
+# run: no extra cap and no extra prompting. Only the two listed values are honoured: a missing or
+# unknown origin FAILS CLOSED as "remote" (it needs the switches and the agent flag).
 ORIGINS = frozenset({"desktop", "remote"})
 
 # Local capability catalog (PLAN 4.4). Caps are enforced on the wire payload and again on the
@@ -294,6 +296,8 @@ SERVER_FEATURES = {
 	"device": True,
 	"control": True,
 	"lease_secret": True,
+	"opaque_realtime": True,
+	"control_nonce": True,
 }
 
 PERMISSION_MODES = frozenset({"full", "sandbox", "ask", "auto"})
@@ -372,6 +376,27 @@ def _result_key(call_id):
 
 def _done_key(call_id):
 	return f"huf:dx:done:{call_id}"
+
+
+def _control_claim_key(call_id):
+	return f"huf:dx:ctlclaim:{call_id}"
+
+
+def _control_claimed(call_id):
+	try:
+		return bool(_raw_client().exists(_k(_control_claim_key(call_id))))
+	except Exception:
+		return True
+
+
+def _claim_control(call_id, ttl):
+	"""Atomically mark a control request as taken by the desktop. True for the first taker only, so
+	a control request is applied at most once: a poll after the desktop already took it (over the
+	socket or an earlier poll), for example after a restart, does not see it again."""
+	try:
+		return bool(_raw_client().set(_k(_control_claim_key(call_id)), 1, nx=True, ex=ttl))
+	except Exception:
+		return False  # cannot prove it is unclaimed: fail closed, do not deliver
 
 
 def _final_key(user, agent_run_id, call_id):
@@ -809,10 +834,16 @@ def register_desktop_executor(
 	device_label=None,
 	remote_control=False,
 	lease_secret=None,
+	opaque_realtime=False,
 ):
 	"""Register (or re-register) a desktop executor lease for the session user.
 
 	Additive fields (an older desktop that sends none of them keeps working, without a device):
+
+	* ``opaque_realtime``: the desktop will fetch a call's payload with ``list_pending_desktop_tool_calls``
+	  (secret-gated) when it receives a payload-free wake event. The realtime event of a call then
+	  carries only ``executor_id``, ``call_id`` and ``kind``: the user's other realtime sockets (web
+	  tabs) never see paths, commands or content. Without it the full request is published as before.
 
 	* ``device_id`` / ``public_key`` / ``device_proof`` / ``proof_ts`` (epoch ms or s): a stable device identity.
 	  ``public_key`` is an Ed25519 key (base64, raw or SPKI DER); ``device_id`` is derived from it
@@ -894,6 +925,7 @@ def register_desktop_executor(
 		"socket_connected": True,
 		"secret_hash": _hash_secret(secret),
 		"remote_control": _to_bool(remote_control),
+		"opaque_realtime": _to_bool(opaque_realtime),
 	}
 	if device:
 		lease["device_id"] = device["device_id"]
@@ -1258,10 +1290,28 @@ def list_pending_desktop_tool_calls(executor_id=None, lease_secret=None):
 	if lease.get("user") != user:
 		raise frappe.PermissionError("This executor id is registered to another user.")
 	_require_secret(lease, lease_secret)
-	return _pending_requests(executor_id)
+	return _pending_requests(executor_id, claim=True)
 
 
-def _pending_requests(executor_id):
+def _publish_call_event(event, request, lease, user):
+	"""Publish a tool call or control request to the user's realtime sockets. Realtime rooms are per
+	USER, so every web tab of the user receives it too: a lease that opted in (``opaque_realtime``)
+	gets a payload-free wake event (ids and kind only) and reads the request from the secret-gated
+	pending list; any other lease gets the full request as before."""
+	if (lease or {}).get("opaque_realtime"):
+		message = {
+			"v": PROTOCOL_VERSION,
+			"opaque": True,
+			"kind": request.get("kind"),
+			"executor_id": request.get("executor_id"),
+			"call_id": request.get("call_id"),
+		}
+	else:
+		message = request
+	frappe.publish_realtime(event=event, message=message, user=user)
+
+
+def _pending_requests(executor_id, claim=False):
 	r = _raw_client()
 	pk = _k(_pending_key(executor_id))
 	out = []
@@ -1273,7 +1323,18 @@ def _pending_requests(executor_id):
 			cid = cid.decode() if isinstance(cid, bytes) else cid
 			stash = _get(_request_key(cid))
 			if isinstance(stash, dict) and stash.get("request"):
-				out.append(stash["request"])
+				request = stash["request"]
+				if request.get("kind") == "control":
+					# Single-use and short-lived: expired ones are dropped, and a delivery through
+					# this poll claims the request so it is never handed out twice.
+					if request.get("expires_at") and int(request["expires_at"]) < now:
+						continue
+					if claim:
+						if not _claim_control(cid, HARD_CAP_S + STASH_TTL_GRACE_S):
+							continue
+					elif _control_claimed(cid):
+						continue
+				out.append(request)
 	except Exception:
 		frappe.log_error(message=frappe.get_traceback(), title="desktop_executor: pending read failed")
 	return out
@@ -1368,6 +1429,13 @@ def submit_desktop_tool_event(call_id=None, executor_id=None, kind=None, payload
 	if not lease or lease.get("user") != user:
 		return {"status": "expired", "message": "This tool call has expired or is unknown."}
 	_require_secret(lease, lease_secret)
+	request = stash.get("request") or {}
+	if request.get("kind") == "control":
+		# A control request that was not taken within its short expiry is dead: a late ack or result
+		# (a replay) is refused and does not count as applied. The first event claims it.
+		if request.get("expires_at") and int(request["expires_at"]) < _now_ms() and kind == "ack":
+			return {"status": "expired", "message": "This control request has expired."}
+		_claim_control(call_id, HARD_CAP_S + STASH_TTL_GRACE_S)
 
 	ttl = HARD_CAP_S + STASH_TTL_GRACE_S
 	if kind not in TERMINAL_KINDS:
@@ -1949,7 +2017,7 @@ def dispatch(
 		return _error(
 			op, label, "capability_unavailable", f"The desktop executor does not support '{op}'."
 		)
-	origin = ctx.get("origin") if ctx.get("origin") in ORIGINS else "desktop"
+	origin = ctx.get("origin") if ctx.get("origin") in ORIGINS else "remote"
 	policy = desktop_policy.sanitize_policy(ctx.get("agent_policy"))
 	if origin == "remote":
 		# Same user on both sides: when remote control is enabled (desktop switch AND the agent's
@@ -1962,8 +2030,8 @@ def dispatch(
 			return _error(
 				op, label, "remote_disabled", "This agent does not allow remote desktop control."
 			)
-	needed = desktop_policy.op_capability(op, params)
-	if policy and needed and desktop_policy.level_of(policy, needed) == "off":
+	needed = desktop_policy.blocked_capability(policy, desktop_policy.op_capabilities(op, params)) if policy else None
+	if needed:
 		return _error(
 			op,
 			label,
@@ -2099,7 +2167,7 @@ def dispatch(
 					op, label, "cache_unavailable", "Could not dispatch the tool call (cache unavailable)."
 				)
 			try:
-				frappe.publish_realtime(event=TOOL_CALL_EVENT, message=request, user=lease["user"])
+				_publish_call_event(TOOL_CALL_EVENT, request, lease, lease["user"])
 			except Exception:
 				_log_failure("desktop_executor: publish failed")
 				final = _error(op, label, "desktop_unreachable", "Could not reach Huf Desktop.")
@@ -2124,7 +2192,7 @@ def dispatch(
 				_budget_charge(scope, charge_s)
 		_release_slots(held)
 		try:
-			_delete(_request_key(call_id), _result_key(call_id))
+			_delete(_request_key(call_id), _result_key(call_id), _control_claim_key(call_id))
 			_raw_client().zrem(_k(_pending_key(executor_id)), call_id)
 		except Exception:
 			pass
@@ -2331,25 +2399,83 @@ def _pin_key():
 	return hashlib.sha256(("huf-dx-pin-v1:" + str(get_encryption_key())).encode("utf-8")).digest()
 
 
-def _pin_message(pin, conversation_id):
+PIN_MAX_AGE_S = 6 * 3600  # a pin older than this (by the run's creation) never confers desktop origin
+
+
+def _norm_creation(value):
+	"""A stable text form of a run's ``creation`` (a datetime from the database, a string from a doc)."""
+	if not value:
+		return ""
+	try:
+		from frappe.utils import get_datetime
+
+		return get_datetime(value).isoformat()
+	except Exception:
+		return str(value)
+
+
+def run_binding(run):
+	"""What a pin signature binds a pin to: the run's own name, conversation, agent, creation time
+	and a digest of its prompt. ``run`` is an Agent Run doc, a dict or any object with those
+	attributes. Copying a pin into another run, or changing the prompt of the run it was written
+	for, breaks the signature."""
+
+	def get(key):
+		if isinstance(run, dict):
+			return run.get(key)
+		return getattr(run, key, None)
+
+	prompt = get("prompt")
+	return {
+		"name": get("name") or "",
+		"conversation": get("conversation") or "",
+		"agent": get("agent") or "",
+		"creation": _norm_creation(get("creation")),
+		"prompt_sha256": hashlib.sha256(str(prompt or "").encode("utf-8")).hexdigest(),
+	}
+
+
+def pin_is_fresh(run, now=None):
+	"""True while the run is younger than ``PIN_MAX_AGE_S`` by its (signed) creation time."""
+	try:
+		from frappe.utils import get_datetime, now_datetime
+
+		created = get_datetime(run.get("creation") if isinstance(run, dict) else getattr(run, "creation", None))
+		return (get_datetime(now) if now else now_datetime()) - created <= datetime.timedelta(
+			seconds=PIN_MAX_AGE_S
+		)
+	except Exception:
+		return False
+
+
+def _pin_key():
+	from frappe.utils.password import get_encryption_key
+
+	return hashlib.sha256(("huf-dx-pin-v2:" + str(get_encryption_key())).encode("utf-8")).digest()
+
+
+def _pin_message(pin, conversation_id, run=None):
 	body = {field: (pin or {}).get(field) for field in PIN_SIGNED_FIELDS}
 	body["conversation"] = conversation_id or ""
+	body["run"] = run_binding(run) if run is not None else None
 	return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
 
-def sign_pin(pin, conversation_id=None):
-	"""HMAC over the security-relevant fields of a run's desktop pin and its conversation, keyed by
-	the site encryption key. ``Agent Run.runtime_context`` is writable by a Huf User on insert, so the
-	worker trusts ``origin`` and ``agent_policy`` from a pin only when this signature verifies."""
-	return hmac.new(_pin_key(), _pin_message(pin, conversation_id), hashlib.sha256).hexdigest()
+def sign_pin(pin, conversation_id=None, run=None):
+	"""HMAC over the security-relevant fields of a run's desktop pin, its conversation and, when
+	``run`` is given, the specific Agent Run (:func:`run_binding`), keyed by the site encryption key.
+	``Agent Run.runtime_context`` is writable by a Huf User, so the worker trusts ``origin`` and
+	``agent_policy`` from a pin only when this signature verifies FOR THE RUN being executed. The
+	run-less form exists for tests; every production caller signs and verifies with the run."""
+	return hmac.new(_pin_key(), _pin_message(pin, conversation_id, run), hashlib.sha256).hexdigest()
 
 
-def verify_pin(pin, conversation_id=None):
+def verify_pin(pin, conversation_id=None, run=None):
 	sig = (pin or {}).get("sig")
 	if not isinstance(sig, str) or not sig:
 		return False
 	try:
-		return hmac.compare_digest(sig, sign_pin(pin, conversation_id))
+		return hmac.compare_digest(sig, sign_pin(pin, conversation_id, run))
 	except Exception:
 		return False
 
@@ -2382,6 +2508,10 @@ def dispatch_control(lease, control_op, params, timeout_ms=CONTROL_TIMEOUT_MS):
 		"deadline_at": issued_at + ACK_TIMEOUT_S * 1000 + int(timeout_ms),
 		"timeout_ms": int(timeout_ms),
 		"origin": "remote",
+		# Single-use nonce and a short expiry (the ack window): the desktop applies a control request
+		# once, and never after ``expires_at``. Additive fields; the server enforces both itself.
+		"nonce": secrets.token_hex(16),
+		"expires_at": issued_at + ACK_TIMEOUT_S * 1000,
 	}
 	ttl = HARD_CAP_S + STASH_TTL_GRACE_S
 	try:
@@ -2393,7 +2523,7 @@ def dispatch_control(lease, control_op, params, timeout_ms=CONTROL_TIMEOUT_MS):
 		_log_failure("desktop_executor: control stash failed")
 		return {"ok": False, "error": {"code": "cache_unavailable", "message": "Could not reach the desktop."}}
 	try:
-		frappe.publish_realtime(event=CONTROL_EVENT, message=request, user=user)
+		_publish_call_event(CONTROL_EVENT, request, lease, user)
 	except Exception:
 		_log_failure("desktop_executor: control publish failed")
 	started = _monotonic()

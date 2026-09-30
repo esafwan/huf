@@ -23,6 +23,7 @@ to call from a worker thread with a plain dict.
 
 import hashlib
 import json
+import re
 
 CAPABILITIES = ("cli", "files", "skills", "local_mcp", "browser", "installs", "processes")
 LEVELS = ("off", "ask", "allowed")
@@ -77,10 +78,43 @@ _OP_CAPABILITY = {
 }
 BROWSER_SERVER = "browser"
 
+# Capabilities an op or tool needs IN ADDITION to its primary one. Running a process or a skill's
+# script is running a command, so it needs command execution (``cli``) as well: ``cli=off`` cannot be
+# sidestepped through ``proc.start`` or ``skill.exec``. Deny wins across all of them.
+_OP_EXTRA_CAPABILITIES = {
+	"proc.start": ("cli",),
+	"skill.exec": ("cli",),
+}
+_TOOL_EXTRA_CAPABILITIES = {
+	"desktop_process_start": ("cli",),
+	"desktop_skill_run": ("cli",),
+}
+# A command that installs packages needs ``installs`` too. The server cannot classify a shell command
+# (the desktop's install classifier is the authority and runs on every call), so this is the coarse
+# server-side mapping: a command whose text names a package manager install verb is refused when the
+# agent's ``installs`` level is ``off``; a command it cannot recognise is left to the desktop.
+_INSTALL_COMMAND = re.compile(
+	r"(?:^|[\s;&|(`$])"
+	r"(?:sudo\s+)?"
+	r"(?:"
+	r"(?:npm|pnpm|yarn|bun|deno)\s+(?:[\w:.-]+\s+)*?(?:i|install|add|ci|exec|dlx|create|x|run\s+npm:)\b"
+	r"|npx\b|bunx\b|uvx\b|pipx\b"
+	r"|(?:pip3?|python3?\s+-m\s+pip|uv(?:\s+pip)?|poetry|pdm|conda|mamba)\s+(?:[\w-]+\s+)*?(?:install|add|sync)\b"
+	r"|(?:brew|apt|apt-get|dnf|yum|pacman|apk|zypper|port|choco|winget|scoop|nix-env|flatpak|snap)\s+(?:[\w-]+\s+)*?(?:install|add|upgrade)\b"
+	r"|(?:cargo|gem|go|composer|bundle|mvn|gradle|dotnet)\s+(?:[\w-]+\s+)*?(?:install|add|get|restore)\b"
+	r"|curl\b[^\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b"
+	r")"
+)
+
 
 def clean_level(value):
-	value = str(value or "").strip().lower()
-	return value if value in LEVELS else DEFAULT_LEVEL
+	"""``off | ask | allowed``. An UNSET value (None or empty) reads as ``allowed`` (the attach model
+	still applies); any other value that is not a known level is a deny: ``off``. A corrupted or
+	widened policy can therefore only ever be stricter, never looser."""
+	if value is None or (isinstance(value, str) and not value.strip()):
+		return DEFAULT_LEVEL
+	value = str(value).strip().lower()
+	return value if value in LEVELS else "off"
 
 
 def default_policy():
@@ -91,9 +125,14 @@ def default_policy():
 
 def sanitize_policy(value):
 	"""A clean policy dict from anything (missing keys default to ``allowed``; remote defaults to
-	false). Returns None when ``value`` is not a dict."""
-	if not isinstance(value, dict):
+	false; an unknown level is ``off``). None stays None (no policy); any other non-dict value is a
+	corrupted policy and denies everything."""
+	if value is None:
 		return None
+	if not isinstance(value, dict):
+		policy = {cap: "off" for cap in CAPABILITIES}
+		policy[REMOTE_FIELD] = False
+		return policy
 	policy = {cap: clean_level(value.get(cap)) for cap in CAPABILITIES}
 	policy[REMOTE_FIELD] = bool(value.get(REMOTE_FIELD))
 	return policy
@@ -115,6 +154,37 @@ def policy_from_agent(agent):
 def policy_hash(policy):
 	blob = json.dumps(sanitize_policy(policy) or {}, sort_keys=True, separators=(",", ":"))
 	return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def tool_capabilities(tool_name):
+	"""Every capability a tool needs (primary first): deny on any one of them removes the tool."""
+	primary = tool_capability(tool_name)
+	if primary is None:
+		return ()
+	return (primary,) + _TOOL_EXTRA_CAPABILITIES.get(tool_name or "", ())
+
+
+def op_capabilities(op, params=None):
+	"""Every capability a wire op needs (primary first). ``exec.run`` and ``proc.start`` add
+	``installs`` when the command looks like a package install."""
+	primary = op_capability(op, params)
+	if primary is None:
+		return ()
+	caps = (primary,) + _OP_EXTRA_CAPABILITIES.get(op, ())
+	if op in ("exec.run", "proc.start"):
+		command = str((params or {}).get("command") or "")
+		if _INSTALL_COMMAND.search(command):
+			caps = caps + ("installs",)
+	return caps
+
+
+def blocked_capability(policy, capabilities):
+	"""The first capability in ``capabilities`` the policy switches off, or None. Deny always wins:
+	one ``off`` among several is enough."""
+	for cap in capabilities or ():
+		if level_of(policy, cap) == "off":
+			return cap
+	return None
 
 
 def tool_capability(tool_name):
@@ -146,5 +216,4 @@ def level_of(policy, capability):
 
 def tool_allowed(policy, tool_name):
 	"""False when the policy switches the tool's capability ``off``."""
-	cap = tool_capability(tool_name)
-	return cap is None or level_of(policy, cap) != "off"
+	return blocked_capability(policy, tool_capabilities(tool_name)) is None

@@ -230,7 +230,9 @@ def _validate_executor_context(
 	# on for the desktop and the agent). ``device_id`` rides the same signature.
 	from huf.ai.desktop_executor import verify_pin
 
-	if verify_pin(desktop_ctx, run.get("conversation") or ""):
+	from huf.ai.desktop_executor import pin_is_fresh
+
+	if verify_pin(desktop_ctx, run.get("conversation") or "", run) and pin_is_fresh(run):
 		ctx["origin"] = desktop_ctx.get("origin") if desktop_ctx.get("origin") in ("desktop", "remote") else "remote"
 		if desktop_ctx.get("agent_policy"):
 			ctx["agent_policy"] = desktop_ctx["agent_policy"]

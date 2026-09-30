@@ -230,6 +230,11 @@ class RemoteBase(unittest.TestCase):
 		context = frappe.parse_json(frappe.db.get_value("Agent Run", run_id, "runtime_context") or "{}")
 		return context.get("desktop")
 
+	def pin_verifies(self, run_id, conversation):
+		"""Does the run's stored pin verify FOR THAT RUN (the way the worker checks it)?"""
+		run = frappe.get_doc("Agent Run", run_id)
+		return dx.verify_pin(self.pin_of(run_id), conversation, run)
+
 	def runs(self, conversation):
 		return frappe.get_all("Agent Run", filters={"conversation": conversation}, pluck="name")
 
@@ -675,7 +680,7 @@ class TestHostedConversation(RemoteBase):
 		pin = self.pin_of(out["run"]["agent_run_id"])
 		self.assertEqual(pin["origin"], "desktop")
 		self.assertEqual(pin["device_id"], self.device.device_id)
-		self.assertTrue(dx.verify_pin(pin, out["conversation_id"]))
+		self.assertTrue(self.pin_verifies(out["run"]["agent_run_id"], out["conversation_id"]))
 
 	def test_the_host_is_exposed_for_the_web_badge(self):
 		conv = self.hosted_conversation()
@@ -817,7 +822,7 @@ class TestHostedConversation(RemoteBase):
 		self.assertEqual(pin["executor_id"], self.exec_id)
 		self.assertEqual(pin["origin"], "remote")
 		self.assertEqual(pin["device_id"], self.device.device_id)
-		self.assertTrue(dx.verify_pin(pin, conv))
+		self.assertTrue(self.pin_verifies(result["agent_run_id"], conv))
 		self.assertEqual(result["desktop_tools"], {"available": True, "reason": None})
 
 	def test_a_desktop_run_carries_desktop_origin(self):
@@ -1048,7 +1053,7 @@ class TestHostedConversation(RemoteBase):
 		run = frappe.get_doc("Agent Run", result["agent_run_id"])
 		context = frappe.parse_json(run.runtime_context)
 		ctx = ai._desktop_ctx_from_runtime_context(
-			context, run_owner=run.owner, conversation_owner=self.owner, conversation_id=conv
+			context, run_owner=run.owner, conversation_owner=self.owner, conversation_id=conv, run=run
 		)
 		self.assertEqual(ctx["origin"], "desktop")
 		self.assertEqual(ctx["device_id"], self.device.device_id)
@@ -1065,7 +1070,7 @@ class TestHostedConversation(RemoteBase):
 		frappe.set_user(self.owner)
 		self.assertIsNone(
 			ai._desktop_ctx_from_runtime_context(
-				context, run_owner=run.owner, conversation_owner=self.owner, conversation_id=conv
+				context, run_owner=run.owner, conversation_owner=self.owner, conversation_id=conv, run=run
 			)
 		)
 
@@ -1075,7 +1080,9 @@ class TestHostedConversation(RemoteBase):
 		self.register(ws=h.workspace(fingerprint="bbbbbbbbbbbbbbbb"))
 		frappe.set_user(self.owner)
 		self.assertEqual(self.send(conv, secret=h.secret_of(self.exec_id))["code"], "workspace_changed")
-		out = ds.rebind_desktop_conversation(conversation=conv)
+		out = ds.rebind_desktop_conversation(
+			conversation=conv, desktop_lease_secret=h.secret_of(self.exec_id)
+		)
 		self.assertTrue(out["ok"])
 		self.assertEqual(out["host_workspace_fingerprint"], "bbbbbbbbbbbbbbbb")
 		row = frappe.db.get_value(
@@ -1094,14 +1101,17 @@ class TestHostedConversation(RemoteBase):
 		self.register(ws=h.workspace(fingerprint="cccccccccccccccc"))
 		frappe.set_user(self.owner)
 		# only a fingerprint the live lease reports
-		out = ds.rebind_desktop_conversation(conversation=conv, workspace_fingerprint="dddddddddddddddd")
+		secret = h.secret_of(self.exec_id)
+		out = ds.rebind_desktop_conversation(
+			conversation=conv, workspace_fingerprint="dddddddddddddddd", desktop_lease_secret=secret
+		)
 		self.assertEqual(out["error"]["code"], "workspace_changed")
 		# not while a run is in flight
 		run = frappe.get_doc(
 			{"doctype": "Agent Run", "agent": self.agent, "conversation": conv, "status": "Queued"}
 		)
 		run.insert(ignore_permissions=True)
-		out = ds.rebind_desktop_conversation(conversation=conv)
+		out = ds.rebind_desktop_conversation(conversation=conv, desktop_lease_secret=secret)
 		self.assertEqual(out["error"]["code"], "run_in_progress")
 		self.finish_runs(conv)
 		# not for someone else
@@ -1374,10 +1384,11 @@ class TestAgentDesktopPolicy(RemoteBase):
 		self.assertEqual(pin["agent_policy"]["browser"], "off")
 		self.assertEqual(pin["agent_policy"]["cli"], "allowed")
 		self.assertTrue(pin["agent_policy"]["allow_remote_desktop"])
-		self.assertTrue(dx.verify_pin(pin, conv))
+		self.assertTrue(self.pin_verifies(result["agent_run_id"], conv))
+		run = frappe.get_doc("Agent Run", result["agent_run_id"])
 		# widening the policy in the stored pin breaks the signature
 		pin["agent_policy"]["browser"] = "allowed"
-		self.assertFalse(dx.verify_pin(pin, conv))
+		self.assertFalse(dx.verify_pin(pin, conv, run))
 		self.assertEqual(len(dp.policy_hash(pin["agent_policy"])), 16)
 
 	def test_a_non_hosted_pinned_run_records_origin_and_policy_too(self):
@@ -1431,9 +1442,412 @@ class TestAgentDesktopPolicy(RemoteBase):
 		self.assertEqual(dp.tool_capability("lmcp__gh__list"), "local_mcp")
 		self.assertTrue(dp.tool_allowed({"cli": "off"}, "desktop_read_file"))
 		self.assertFalse(dp.tool_allowed({"cli": "off"}, "desktop_run_command"))
-		self.assertEqual(dp.sanitize_policy({"cli": "root", "files": "ASK"})["cli"], "allowed")
+		# an unknown level is a deny; an unset one is the default
+		self.assertEqual(dp.sanitize_policy({"cli": "root", "files": "ASK"})["cli"], "off")
 		self.assertEqual(dp.sanitize_policy({"files": "ASK"})["files"], "ask")
-		self.assertIsNone(dp.sanitize_policy("nope"))
+		self.assertEqual(dp.sanitize_policy({"files": "ASK"})["cli"], "allowed")
+		# a corrupted (non-dict) policy denies everything; no policy stays no policy
+		self.assertEqual(set(dp.sanitize_policy("nope")[c] for c in dp.CAPABILITIES), {"off"})
+		self.assertIsNone(dp.sanitize_policy(None))
+
+
+# --------------------------------------------------------------------------
+# 7. Hardening from the final review (FIX-BACKEND)
+# --------------------------------------------------------------------------
+
+
+class TestRunPinBinding(RemoteBase):
+	"""H1: a signed pin is bound to the specific Agent Run it was written for."""
+
+	def setUp(self):
+		super().setUp()
+		self.out = self.register(remote_control=False)
+		self.secret = self.out["lease_secret"]
+		self.make_agent()
+		self.conv = self.hosted_conversation()
+		# a desktop-origin run, as the desktop itself starts one (with the secret)
+		self.run1 = self.send(self.conv, secret=self.secret)["agent_run_id"]
+		self.pin = self.pin_of(self.run1)
+		self.assertEqual(self.pin["origin"], "desktop")
+		self.finish_runs(self.conv)
+
+	def worker_ctx(self, run_name):
+		run = frappe.get_doc("Agent Run", run_name)
+		frappe.set_user("Administrator")  # what the orphan sweeper's drain job runs as
+		try:
+			return ai._build_execution_kwargs(run, frappe.parse_json(run.runtime_context))["desktop_ctx"]
+		finally:
+			frappe.set_user(self.owner)
+
+	def tool_ctx(self, run_name):
+		"""The ctx the tool handlers build for a run (what dispatch receives)."""
+		frappe.set_user(self.owner)
+		return dw._validate_executor_context(
+			_dx_executor_id=self.exec_id,
+			_dx_fingerprint=h.FP,
+			_dx_user=self.owner,
+			agent_run_id=run_name,
+			_dx_pin=dw.issue_pin_token(run_name, self.exec_id, self.owner),
+		)
+
+	def web_insert_run(self, pin, prompt="attacker prompt"):
+		"""What the web session can do: insert an Agent Run with permission checks ON."""
+		frappe.set_user(self.owner)
+		run = frappe.get_doc(
+			{
+				"doctype": "Agent Run",
+				"agent": self.agent,
+				"conversation": self.conv,
+				"status": "Queued",
+				"prompt": prompt,
+				"runtime_context": frappe.as_json({"desktop": pin}),
+			}
+		)
+		run.insert()
+		frappe.db.commit()
+		return run.name
+
+	def test_an_honest_run_keeps_desktop_origin_on_both_sides(self):
+		self.assertEqual(self.worker_ctx(self.run1)["origin"], "desktop")
+		self.assertEqual(self.tool_ctx(self.run1)["origin"], "desktop")
+
+	def test_a_pin_copied_into_a_new_run_is_remote_in_the_worker_and_at_dispatch(self):
+		# the web session reads the pin over REST and inserts a NEW run in the same conversation with it
+		copied = frappe.parse_json(frappe.as_json(self.pin))
+		self.assertTrue(dx.verify_pin(copied, self.conv, frappe.get_doc("Agent Run", self.run1)))
+		run2 = self.web_insert_run(copied)
+		self.assertEqual(self.worker_ctx(run2)["origin"], "remote")
+		self.assertEqual(self.tool_ctx(run2)["origin"], "remote")
+		# and with remote control off the dispatcher refuses it
+		ctx = self.tool_ctx(run2)
+		frappe.set_user(self.owner)
+		out = dx.dispatch("fs.read", {"path": "a.txt"}, ctx, call_id="c-copied-1", agent_run_id=run2)
+		self.assertEqual(out["error"]["code"], "remote_disabled")
+
+	def test_a_run_rewritten_and_requeued_with_a_new_prompt_loses_desktop_origin(self):
+		frappe.set_user(self.owner)
+		run = frappe.get_doc("Agent Run", self.run1)
+		run.prompt = "something the desktop user never sent"
+		run.status = "Queued"
+		run.save()
+		frappe.db.commit()
+		self.assertEqual(self.worker_ctx(self.run1)["origin"], "remote")
+		self.assertEqual(self.tool_ctx(self.run1)["origin"], "remote")
+
+	def test_a_web_session_cannot_rewrite_runtime_context_of_an_existing_run(self):
+		frappe.set_user(self.owner)
+		run = frappe.get_doc("Agent Run", self.run1)
+		forged = frappe.parse_json(run.runtime_context)
+		forged["desktop"]["origin"] = "desktop"
+		forged["desktop"]["agent_policy"] = {"cli": "allowed"}
+		run.runtime_context = frappe.as_json(forged)
+		with self.assertRaises(frappe.PermissionError):
+			run.save()
+		# through the same path REST set_value uses
+		with self.assertRaises(frappe.PermissionError):
+			frappe.client.set_value("Agent Run", self.run1, "runtime_context", frappe.as_json(forged))
+
+	def test_a_pin_is_bound_to_its_conversation_agent_and_creation_too(self):
+		run = frappe.get_doc("Agent Run", self.run1)
+		for field, value in (
+			("conversation", "AC-other"),
+			("agent", "another-agent"),
+			("creation", "2001-01-01 00:00:00.000000"),
+		):
+			other = frappe._dict(name=run.name, conversation=run.conversation, agent=run.agent, creation=run.creation, prompt=run.prompt)
+			other[field] = value
+			self.assertFalse(dx.verify_pin(self.pin, run.conversation, other), field)
+
+	def test_an_old_run_no_longer_confers_desktop_origin(self):
+		run = frappe.get_doc("Agent Run", self.run1)
+		old = "2001-01-01 00:00:00.000000"
+		frappe.db.set_value("Agent Run", self.run1, "creation", old, update_modified=False)
+		run.creation = old
+		pin = dict(self.pin)
+		pin.pop("sig")
+		pin["sig"] = dx.sign_pin(pin, self.conv, run)  # a genuine, correctly signed, but ancient pin
+		frappe.db.set_value(
+			"Agent Run", self.run1, "runtime_context", frappe.as_json({"desktop": pin}), update_modified=False
+		)
+		self.assertEqual(self.worker_ctx(self.run1)["origin"], "remote")
+		self.assertEqual(self.tool_ctx(self.run1)["origin"], "remote")
+
+
+class TestMissingOriginFailsClosed(RemoteBase):
+	"""H5 (backend half): a call with no or an unknown origin is a REMOTE call."""
+
+	def setUp(self):
+		super().setUp()
+		self.register(remote_control=False)
+		self.make_agent()
+
+	def ctx(self, **extra):
+		ctx = {"executor_id": self.exec_id, "fingerprint": h.FP, "user": self.owner, "label": "w"}
+		ctx.update(extra)
+		return ctx
+
+	def test_a_ctx_without_origin_is_refused_while_remote_control_is_off(self):
+		frappe.set_user(self.owner)
+		out = dx.dispatch("fs.read", {"path": "a.txt"}, self.ctx(), call_id="c-noorigin-1")
+		self.assertEqual(out["error"]["code"], "remote_disabled")
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+
+	def test_an_unknown_origin_is_refused_too(self):
+		frappe.set_user(self.owner)
+		for junk in ("admin", "", None, 1, "DESKTOP"):
+			out = dx.dispatch("fs.read", {"path": "a.txt"}, self.ctx(origin=junk), call_id=f"c-junk-{junk}")
+			self.assertEqual(out["error"]["code"], "remote_disabled", repr(junk))
+
+	def test_an_explicit_desktop_origin_still_goes_through(self):
+		call_id = f"call-rs-{frappe.generate_hash(length=10)}"
+		thread, errors, seen = self.play(call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {}})])
+		frappe.set_user(self.owner)
+		out = dx.dispatch("fs.read", {"path": "a.txt"}, self.ctx(origin="desktop"), call_id=call_id)
+		self.finish(thread, errors)
+		self.assertTrue(out["ok"])
+		self.assertEqual(seen[0]["origin"], "desktop")
+
+
+class TestPolicyCeilingHoles(RemoteBase):
+	"""M1: deny always wins, and nothing an agent leaves unmapped slips through."""
+
+	def setUp(self):
+		super().setUp()
+		self.register(remote_control=True)
+		frappe.set_user(self.owner)
+
+	def ctx(self, policy):
+		return {
+			"executor_id": self.exec_id,
+			"fingerprint": h.FP,
+			"user": self.owner,
+			"label": "w",
+			"origin": "desktop",
+			"agent_policy": policy,
+		}
+
+	def denied(self, op, params, policy):
+		frappe.set_user(self.owner)
+		out = dx.dispatch(op, params, self.ctx(policy), call_id=f"c-{frappe.generate_hash(length=8)}")
+		self.assertEqual(h.list_pending_desktop_tool_calls(executor_id=self.exec_id), [])
+		return out
+
+	def test_cli_off_also_blocks_proc_start_and_skill_exec(self):
+		policy = {**dp.default_policy(), "cli": "off"}
+		for op, params in (
+			("proc.start", {"name": "dev", "command": "node server.js", "cwd": "."}),
+			("skill.exec", {"skill": "x", "path": "run.sh", "args": []}),
+			("exec.run", {"command": "ls"}),
+		):
+			out = self.denied(op, params, policy)
+			self.assertEqual(out["error"]["code"], "denied_by_policy", op)
+			self.assertIn("cli", out["error"]["message"], op)
+
+	def test_cli_off_removes_the_process_start_and_skill_run_tools(self):
+		agent = self.make_agent(desktop_access_cli="off")
+		ctx = dx.resolve_desktop_ctx(self.exec_id, self.owner)
+		tools = {t.name for t in create_agent_tools(frappe.get_doc("Agent", agent.name), desktop_ctx=ctx)}
+		self.assertNotIn("desktop_run_command", tools)
+		self.assertNotIn("desktop_process_start", tools)
+		self.assertNotIn("desktop_skill_run", tools)
+		self.assertEqual(dp.tool_capabilities("desktop_process_start"), ("processes", "cli"))
+
+	def test_installs_off_blocks_an_install_command_and_only_that(self):
+		policy = {**dp.default_policy(), "installs": "off"}
+		for command in ("npm install left-pad", "pip install requests", "sudo apt-get install -y jq", "cd x && pnpm add y"):
+			out = self.denied("exec.run", {"command": command}, policy)
+			self.assertEqual(out["error"]["code"], "denied_by_policy", command)
+			self.assertIn("installs", out["error"]["message"], command)
+		out = self.denied("proc.start", {"name": "i", "command": "yarn add z", "cwd": "."}, policy)
+		self.assertEqual(out["error"]["code"], "denied_by_policy")
+		self.assertNotIn("installs", dp.op_capabilities("exec.run", {"command": "npm run build"}))
+		self.assertNotIn("installs", dp.op_capabilities("exec.run", {"command": "git commit -m install"}))
+
+	def test_an_unknown_level_denies_instead_of_allowing(self):
+		self.assertEqual(dp.clean_level("root"), "off")
+		self.assertEqual(dp.clean_level("Allowed "), "allowed")
+		self.assertEqual(dp.clean_level(None), "allowed")
+		out = self.denied("exec.run", {"command": "ls"}, {**dp.default_policy(), "cli": "bogus"})
+		self.assertEqual(out["error"]["code"], "denied_by_policy")
+		self.assertFalse(dp.tool_allowed({"cli": "bogus"}, "desktop_run_command"))
+		# a corrupted, non-dict policy denies everything
+		out = self.denied("fs.read", {"path": "a"}, "garbage")
+		self.assertEqual(out["error"]["code"], "denied_by_policy")
+
+	def test_deny_wins_when_one_of_several_capabilities_is_off(self):
+		self.assertEqual(dp.blocked_capability({"processes": "allowed", "cli": "off"}, ("processes", "cli")), "cli")
+		self.assertEqual(dp.blocked_capability({"processes": "off", "cli": "allowed"}, ("processes", "cli")), "processes")
+		self.assertIsNone(dp.blocked_capability({"processes": "ask", "cli": "ask"}, ("processes", "cli")))
+
+
+class TestRebindNeedsTheDesktopOrRemoteControl(RemoteBase):
+	"""M2: a web session cannot re-point a hosted conversation while remote control is off."""
+
+	def setUp(self):
+		super().setUp()
+		self.out = self.register(remote_control=False)
+		self.make_agent()
+		self.conv = self.hosted_conversation()
+		self.register(ws=h.workspace(fingerprint="eeeeeeeeeeeeeeee"), remote_control=False)
+		self.secret = h.secret_of(self.exec_id)
+		frappe.set_user(self.owner)
+
+	def fingerprint(self):
+		return frappe.db.get_value("Agent Conversation", self.conv, "host_workspace_fingerprint")
+
+	def test_a_web_session_without_the_secret_is_refused_and_nothing_changes(self):
+		out = ds.rebind_desktop_conversation(conversation=self.conv)
+		self.assertEqual(out["error"]["code"], "remote_disabled")
+		self.assertEqual(self.fingerprint(), h.FP)
+		self.assertEqual(self.audit_rows("rebind", self.device.device_id)[0].outcome, "remote_disabled")
+		# a wrong secret is the same as none
+		out = ds.rebind_desktop_conversation(conversation=self.conv, desktop_lease_secret="not-the-secret")
+		self.assertEqual(out["error"]["code"], "remote_disabled")
+		self.assertEqual(self.fingerprint(), h.FP)
+
+	def test_the_desktop_with_its_secret_can_rebind(self):
+		out = ds.rebind_desktop_conversation(conversation=self.conv, desktop_lease_secret=self.secret)
+		self.assertTrue(out["ok"])
+		self.assertEqual(self.fingerprint(), "eeeeeeeeeeeeeeee")
+		self.assertEqual(self.audit_rows("rebind", self.device.device_id)[0].origin, "desktop")
+
+	def test_a_web_session_can_rebind_once_remote_control_is_on(self):
+		self.register(ws=h.workspace(fingerprint="eeeeeeeeeeeeeeee"), remote_control=True)
+		frappe.set_user(self.owner)
+		out = ds.rebind_desktop_conversation(conversation=self.conv)
+		self.assertTrue(out["ok"])
+		self.assertEqual(self.audit_rows("rebind", self.device.device_id)[0].origin, "remote")
+
+
+class TestControlRequestReplay(RemoteBase):
+	"""M8 (backend half): a control request is single-use and short-lived."""
+
+	def setUp(self):
+		super().setUp()
+		self.register(remote_control=True, ws=h.workspace(mode="ask"))
+		frappe.set_user(self.owner)
+
+	def pending_control(self, timeout_s=15):
+		deadline = time.monotonic() + timeout_s
+		while time.monotonic() < deadline:
+			for req in h.list_pending_desktop_tool_calls(executor_id=self.exec_id):
+				if req.get("kind") == "control":
+					return req
+			time.sleep(0.05)
+		raise AssertionError("no control request reached the desktop")
+
+	def raw_pending_controls(self):
+		return [r for r in h.list_pending_desktop_tool_calls(executor_id=self.exec_id) if r.get("kind") == "control"]
+
+	def test_the_request_carries_a_nonce_and_a_short_expiry(self):
+		seen = []
+
+		def desktop():
+			seen.append(self.pending_control())
+
+		thread, errors = h.run_in_thread(desktop)
+		with mock.patch.object(dx, "ACK_TIMEOUT_S", 1):
+			ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full")
+		self.finish(thread, errors)
+		request = seen[0]
+		self.assertRegex(request["nonce"], r"^[0-9a-f]{32}$")
+		self.assertEqual(request["expires_at"], request["issued_at"] + 1000)
+
+	def test_a_control_request_is_delivered_by_the_pending_list_only_once(self):
+		second = []
+
+		def desktop():
+			first = self.pending_control()  # the first poll takes it
+			second.append((first, self.raw_pending_controls()))  # a poll after a "restart"
+
+		thread, errors = h.run_in_thread(desktop)
+		with mock.patch.object(dx, "ACK_TIMEOUT_S", 2):
+			ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full")
+		self.finish(thread, errors)
+		first, again = second[0]
+		self.assertEqual(first["kind"], "control")
+		self.assertEqual(again, [], "a control request must not be handed out a second time")
+
+	def test_heartbeat_listing_does_not_consume_a_control_request(self):
+		seen = []
+
+		def desktop():
+			deadline = time.monotonic() + 10
+			ids = []
+			while time.monotonic() < deadline and not ids:
+				ids = h.heartbeat_desktop_executor(
+					executor_id=self.exec_id, workspace=h.workspace(mode="ask")
+				).get("pending_call_ids") or []
+				time.sleep(0.05)
+			seen.append(ids)
+			seen.append(self.pending_control())  # still available to the poll after a heartbeat saw it
+
+		thread, errors = h.run_in_thread(desktop)
+		with mock.patch.object(dx, "ACK_TIMEOUT_S", 3):
+			ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full")
+		self.finish(thread, errors)
+		self.assertEqual(len(seen[0]), 1)
+		self.assertEqual(seen[1]["call_id"], seen[0][0])
+
+	def test_a_control_request_past_its_expiry_is_not_listed(self):
+		def desktop():
+			request = self.pending_control()
+			# the same request is gone from the list once it has expired, claimed or not
+			with mock.patch.object(dx, "_now_ms", return_value=request["expires_at"] + 5000):
+				self.assertEqual(self.raw_pending_controls(), [])
+
+		thread, errors = h.run_in_thread(desktop)
+		with mock.patch.object(dx, "ACK_TIMEOUT_S", 2):
+			ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full")
+		self.finish(thread, errors)
+
+
+class TestRealtimeDoesNotLeakPayloads(RemoteBase):
+	"""L2: realtime rooms are per user, so an opted-in desktop gets only ids and fetches the rest."""
+
+	def setUp(self):
+		super().setUp()
+		self.make_agent()
+
+	def published(self, opaque):
+		self.register(remote_control=True, opaque_realtime=opaque)
+		frappe.set_user(self.owner)
+		ctx = {
+			"executor_id": self.exec_id,
+			"fingerprint": h.FP,
+			"user": self.owner,
+			"label": "w",
+			"origin": "desktop",
+		}
+		with mock.patch("frappe.publish_realtime") as publish, mock.patch.object(dx, "ACK_TIMEOUT_S", 1):
+			dx.dispatch("fs.read", {"path": "secret/plans.txt"}, ctx, call_id="c-leak-1")
+		calls = [c for c in publish.call_args_list if c.kwargs.get("event") == dx.TOOL_CALL_EVENT]
+		self.assertEqual(len(calls), 1)
+		return calls[0].kwargs["message"]
+
+	def test_an_opted_in_desktop_gets_a_payload_free_wake_event(self):
+		message = self.published(True)
+		self.assertEqual(set(message), {"v", "opaque", "kind", "executor_id", "call_id"})
+		self.assertNotIn("secret/plans.txt", json.dumps(message))
+
+	def test_a_legacy_desktop_still_gets_the_full_request(self):
+		message = self.published(False)
+		self.assertEqual(message["params"], {"path": "secret/plans.txt"})
+
+	def test_the_control_event_is_opaque_for_an_opted_in_desktop(self):
+		self.register(remote_control=True, opaque_realtime=True)
+		frappe.set_user(self.owner)
+		with mock.patch("frappe.publish_realtime") as publish, mock.patch.object(dx, "ACK_TIMEOUT_S", 1):
+			ds.set_desktop_permission_mode(device_id=self.device.device_id, mode="full")
+		message = [c.kwargs["message"] for c in publish.call_args_list if c.kwargs.get("event") == dx.CONTROL_EVENT][0]
+		self.assertEqual(set(message), {"v", "opaque", "kind", "executor_id", "call_id"})
+		self.assertNotIn("params", message)
+
+	def test_the_lease_flag_and_feature_are_reported(self):
+		out = self.register(opaque_realtime=True)
+		self.assertTrue(out["features"]["opaque_realtime"])
+		self.assertTrue(out["features"]["control_nonce"])
+		self.assertTrue(dx._get_lease(self.exec_id)["opaque_realtime"])
 
 
 if __name__ == "__main__":

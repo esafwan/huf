@@ -1215,11 +1215,14 @@ def _resolve_desktop_for_run(agent_doc, conversation, desktop_executor_id, deskt
     return ctx, status, None
 
 
-def _desktop_runtime_context(desktop_ctx, conversation_id=None):
+def _desktop_runtime_context(desktop_ctx, conversation_id=None, run=None, sign=True):
     """Persistable pin for ``runtime_context['desktop']`` (identifiers only, no secrets).
 
     ``origin``, ``device_id`` and ``agent_policy`` are covered by ``sig``: ``runtime_context`` is
-    writable by a Huf User on insert, so the worker honours them only from a verified pin.
+    writable by a Huf User, so the worker honours them only from a verified pin. With ``run`` the
+    signature also binds the pin to that Agent Run (name, conversation, agent, creation, prompt), so
+    it cannot be replayed in another run. ``sign=False`` returns the pin without a signature (the
+    run does not exist yet; :func:`_sign_run_desktop_pin` signs it right after the insert).
     """
     if not desktop_ctx:
         return None
@@ -1241,11 +1244,33 @@ def _desktop_runtime_context(desktop_ctx, conversation_id=None):
         pin["device_id"] = desktop_ctx["device_id"]
     if desktop_ctx.get("agent_policy"):
         pin["agent_policy"] = desktop_ctx["agent_policy"]
-    pin["sig"] = sign_pin(pin, conversation_id)
+    if sign:
+        pin["sig"] = sign_pin(pin, conversation_id, run)
     return pin
 
 
-def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owner=None, conversation_id=None):
+def _sign_run_desktop_pin(run_doc, runtime_context, conversation_id):
+    """Sign the desktop pin of a just-inserted run, bound to that run, and store it.
+
+    The run name and creation time exist only after the insert, so the pin is written unsigned and
+    signed in the same transaction (nothing can drain the run before it commits). An unsigned pin
+    is treated as remote, so a failure here fails closed."""
+    from huf.ai.desktop_executor import sign_pin
+
+    pin = dict((runtime_context or {}).get("desktop") or {})
+    if not pin:
+        return
+    pin.pop("sig", None)
+    pin["sig"] = sign_pin(pin, conversation_id, run_doc)
+    runtime_context["desktop"] = pin
+    frappe.db.set_value(
+        "Agent Run", run_doc.name, "runtime_context", frappe.as_json(runtime_context), update_modified=False
+    )
+
+
+def _desktop_ctx_from_runtime_context(
+    context, run_owner=None, conversation_owner=None, conversation_id=None, run=None
+):
     """Re-resolve a pinned desktop ctx in the worker.
 
     The identity comes from the run OWNER, never from the session user (a queued run
@@ -1287,9 +1312,12 @@ def _desktop_ctx_from_runtime_context(context, run_owner=None, conversation_owne
     # altered pin (a forged Agent Run) is treated as REMOTE with no policy, which the dispatcher
     # refuses unless remote control is on for the desktop and the agent.
     try:
-        from huf.ai.desktop_executor import verify_pin
+        from huf.ai.desktop_executor import pin_is_fresh, verify_pin
 
-        signed = verify_pin(pinned, conversation_id)
+        # The signature must be FOR THIS RUN (name, conversation, agent, creation, prompt): a pin
+        # copied out of another run, or kept while the run is rewritten and re-queued, fails it. With
+        # no run to bind to, nothing verifies.
+        signed = run is not None and verify_pin(pinned, conversation_id, run) and pin_is_fresh(run)
     except Exception:
         signed = False
     if signed:
@@ -1499,7 +1527,7 @@ def run_agent_sync(
         "skip_user_message": skip_user_message,
     }
     if desktop_ctx:
-        runtime_context["desktop"] = _desktop_runtime_context(desktop_ctx, conversation.name)
+        runtime_context["desktop"] = _desktop_runtime_context(desktop_ctx, conversation.name, sign=False)
 
     run_doc_data = {
         "doctype": "Agent Run",
@@ -1575,6 +1603,8 @@ def run_agent_sync(
 
     run_doc = frappe.get_doc(run_doc_data)
     run_doc.insert()
+    if desktop_ctx:
+        _sign_run_desktop_pin(run_doc, runtime_context, conversation.name)
 
     execution_kwargs = {
         "agent_name": agent_name,
@@ -3041,6 +3071,7 @@ def _build_execution_kwargs(run_doc, context: dict):
             run_owner=getattr(run_doc, "owner", None),
             conversation_owner=_conversation_owner(getattr(run_doc, "conversation", None)),
             conversation_id=getattr(run_doc, "conversation", None),
+            run=run_doc,
         ),
     }
 
