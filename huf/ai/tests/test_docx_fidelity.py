@@ -198,11 +198,14 @@ class TestFormatPreviewIsTheExportFile(unittest.TestCase):
 			preview, export = self._pair(fmt)
 			self.assertEqual(preview["content_base64"], export["content_base64"], fmt)
 
-	def test_pdf_payload_reports_its_own_hash(self):
-		preview, _export = self._pair("pdf")
+	def test_pdf_preview_bytes_hash_equal_export_bytes(self):
+		# WeasyPrint writes no creation date or random file ID for these
+		# documents (measured on the bench, 2026-09-30), so PDF holds too.
+		preview, export = self._pair("pdf")
 		data = base64.b64decode(preview["content_base64"])
 		self.assertTrue(data.startswith(b"%PDF"))
 		self.assertEqual(preview["sha256"], hashlib.sha256(data).hexdigest())
+		self.assertEqual(preview["sha256"], export["sha256"])
 
 	def test_rejects_unknown_format_and_empty_content(self):
 		with self.assertRaises(frappe.ValidationError):
