@@ -44,6 +44,7 @@ from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from huf.ai.artifacts.render import design_tokens as tokens
 from docx.shared import Cm, Emu, Inches, Pt, RGBColor
 
 from huf.ai.artifacts.render.components import COMPONENTS, COMPONENT_CLASSES, THEME, resolve_theme_token
@@ -1107,16 +1108,15 @@ def _add_field_run(paragraph, field_code: str) -> None:
 # ---------------------------------------------------------------------------
 
 #: Fonts present on Windows, macOS and Google Docs, so every renderer draws
-#: the same face. The HTML's Google Fonts (Source Sans 3 / Source Serif 4 /
-#: JetBrains Mono) are not installed where Word runs, and Word has no CSS
-#: fallback chain - it would silently substitute something else.
-BODY_FONT = "Arial"
-HEADING_FONT = "Georgia"
-MONO_FONT = "Courier New"
+#: the same face. Families, sizes and spacing come from design_tokens, the
+#: same module the HTML/PDF stylesheet reads, so the formats cannot drift.
+BODY_FONT = tokens.BODY_FONT
+HEADING_FONT = tokens.HEADING_FONT
+MONO_FONT = tokens.MONO_FONT
 
 #: Heading sizes and spacing mirror PRINT_STYLESHEET's h1-h6 rules.
-_HEADING_SIZES_PT = {1: 28, 2: 22, 3: 18, 4: 14, 5: 12, 6: 11}
-_HEADING_SPACE_BEFORE_PT = {1: 14, 2: 14, 3: 12, 4: 10, 5: 8, 6: 6}
+_HEADING_SIZES_PT = tokens.HEADING_SIZES_PT
+_HEADING_SPACE_BEFORE_PT = tokens.HEADING_SPACE_BEFORE_PT
 
 #: OOXML child order for the property elements this module inserts into, so
 #: every element lands where the schema (and strict consumers) expect it.
