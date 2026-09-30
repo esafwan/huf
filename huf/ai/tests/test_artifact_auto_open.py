@@ -123,7 +123,11 @@ class TestArtifactAutoOpen(unittest.TestCase):
 	def test_a_realtime_failure_never_blocks_the_save(self):
 		msg = self._message(DOC_TAG)
 		frappe.db.delete("Artifact", {"message": msg.name})
-		with mock.patch("frappe.publish_realtime", side_effect=RuntimeError("redis down")):
+		def flaky(*args, **kwargs):
+			if str(kwargs.get("event", "")).startswith("conversation:"):
+				raise RuntimeError("redis down")
+
+		with mock.patch("frappe.publish_realtime", side_effect=flaky):
 			sync_message_artifacts(msg)
 		self.assertEqual(frappe.db.count("Artifact", {"message": msg.name}), 1)
 
