@@ -131,6 +131,8 @@ def handle_show_artifact(**kwargs) -> str:
 			"type": "open_artifact_pane",
 			"artifact_id": artifact.name,
 			"conversation_id": conversation_id,
+			"artifact_type": artifact.artifact_type,
+			"title": artifact.title or "",
 		},
 		user=frappe.session.user,
 	)
@@ -202,6 +204,33 @@ def _find_artifact_by_title(title: str, conversation_id: str = ""):
 	return None
 
 
+def _announce_exported_file(conversation_id: str, file_url: str, file_name: str, export_format: str) -> None:
+	"""Ask the owner's open client to show a freshly exported file in the artifacts pane.
+
+	A distinct event type (``open_file_artifact``) rather than ``open_artifact_pane``:
+	that one carries an Artifact id and existing clients read it as such. Needs the run's
+	conversation (injected from the run context on most paths); without one there is no
+	channel to publish on and nothing is sent. Never raises.
+	"""
+	try:
+		if not conversation_id or not frappe.db.exists("Agent Conversation", conversation_id):
+			return
+		frappe.publish_realtime(
+			event=f"conversation:{conversation_id}",
+			message={
+				"type": "open_file_artifact",
+				"conversation_id": conversation_id,
+				"file_url": file_url,
+				"file_name": file_name,
+				"format": export_format,
+			},
+			user=frappe.session.user,
+			after_commit=True,
+		)
+	except Exception:
+		frappe.log_error(title="Exported file open event failed", message=frappe.get_traceback())
+
+
 def handle_export_document(**kwargs) -> str:
 	"""Produce a downloadable PDF / DOCX / HTML / Markdown file from a document.
 
@@ -266,6 +295,8 @@ def handle_export_document(**kwargs) -> str:
 		return json.dumps({"success": False, "error": "You do not have permission to export this document."})
 	except Exception as e:
 		return json.dumps({"success": False, "error": str(e)})
+
+	_announce_exported_file(conversation_id, file_url, file_name, export_format)
 
 	return json.dumps({
 		"success": True,
