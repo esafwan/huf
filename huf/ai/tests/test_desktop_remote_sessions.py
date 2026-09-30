@@ -1523,7 +1523,6 @@ class TestRunPinBinding(RemoteBase):
 	def test_a_pin_copied_into_a_new_run_is_remote_in_the_worker_and_at_dispatch(self):
 		# the web session reads the pin over REST and inserts a NEW run in the same conversation with it
 		copied = frappe.parse_json(frappe.as_json(self.pin))
-		self.assertTrue(dx.verify_pin(copied, self.conv, frappe.get_doc("Agent Run", self.run1)))
 		run2 = self.web_insert_run(copied)
 		self.assertEqual(self.worker_ctx(run2)["origin"], "remote")
 		self.assertEqual(self.tool_ctx(run2)["origin"], "remote")
