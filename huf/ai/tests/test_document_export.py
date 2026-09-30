@@ -39,12 +39,18 @@ DOC = "# Quarterly Report\n\nRevenue grew **18.4%** in the quarter.\n\n| Region 
 
 def _read_file(file_url: str) -> bytes:
 	name = frappe.db.get_value("File", {"file_url": file_url}, "name")
-	return frappe.get_doc("File", name).get_content()
+	content = frappe.get_doc("File", name).get_content()
+	return content.encode("utf-8") if isinstance(content, str) else content
 
 
 def _pdf_pages(data: bytes) -> int:
-	# Page objects, not the /Pages tree node.
-	return len(re.findall(rb"/Type\s*/Page(?![s\w])", data))
+	try:
+		from pypdf import PdfReader
+	except ImportError:
+		# Uncompressed page tree only: the /Count of the root /Pages node.
+		counts = re.findall(rb"/Count\s+(\d+)", data)
+		return max((int(c) for c in counts), default=0)
+	return len(PdfReader(io.BytesIO(data)).pages)
 
 
 def _docx_body(data: bytes) -> str:
