@@ -1,14 +1,17 @@
 import { describe, it, expect } from 'vitest'
-import { createElement } from 'react'
+import { createElement, type ComponentType } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import JsxParser from 'react-jsx-parser'
 import { extractJsxAndBindings, stripJsxComments } from './jsxPreambleParser'
+
+// react-jsx-parser bundles its own @types/react copy; identity is compatible at runtime (same cast as jsx-preview.tsx).
+const Parser = JsxParser as unknown as ComponentType<Record<string, unknown>>
 
 function render(source: string): { html: string; errors: string[] } {
   const { jsx, bindings } = extractJsxAndBindings(source)
   const errors: string[] = []
   const html = renderToStaticMarkup(
-    createElement(JsxParser, { jsx, bindings, renderInWrapper: false, onError: (e: Error) => errors.push(e.message) })
+    createElement(Parser, { jsx, bindings, renderInWrapper: false, onError: (e: Error) => errors.push(e.message) })
   )
   return { html, errors }
 }
@@ -17,7 +20,7 @@ describe('JSX comment-only brace groups (JSXEmptyExpression)', () => {
   it('the raw parser really does fail on a comment brace group (documents the bug)', () => {
     const errors: string[] = []
     renderToStaticMarkup(
-      createElement(JsxParser, { jsx: '<div>{/* note */}<p>x</p></div>', renderInWrapper: false, onError: (e: Error) => errors.push(e.message) })
+      createElement(Parser, { jsx: '<div>{/* note */}<p>x</p></div>', renderInWrapper: false, onError: (e: Error) => errors.push(e.message) })
     )
     expect(errors.join(' ')).toMatch(/JSXEmptyExpression/)
   })
