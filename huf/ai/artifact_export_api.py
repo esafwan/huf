@@ -171,7 +171,59 @@ def export_artifact(name: str, format: str) -> dict:
 	# afterward, despite the 200 response.
 	frappe.db.commit()
 
-	return {"file_url": file_doc.file_url, "format": format}
+	return {"file_url": file_doc.file_url, "format": format, "sha256": _sha256(rendered_bytes)}
+
+
+def _sha256(data: bytes) -> str:
+	import hashlib
+
+	return hashlib.sha256(data).hexdigest()
+
+
+@frappe.whitelist()
+def preview_artifact_file(name: str, format: str) -> dict:
+	"""The exact file ``export_artifact`` would save, returned inline for preview.
+
+	Format previews (DOCX, PDF) must be rendered FROM THE FILE the user gets,
+	not from a look-alike: this renders through the same ``_render_bytes`` as
+	export_artifact and returns the bytes base64-encoded with their sha256,
+	so the client can show them and save exactly those bytes. Read-only like
+	get_artifact_html: no File row, no commit.
+	"""
+	if not name:
+		frappe.throw(_("Artifact name is required"), frappe.ValidationError)
+	_check_format(format)
+	artifact = frappe.get_doc("Artifact", name)
+	_check_conversation_access(artifact.conversation)
+	if artifact.artifact_type not in _EXPORTABLE_ARTIFACT_TYPES:
+		frappe.throw(
+			_("Artifact type {0} cannot be rendered as a document.").format(artifact.artifact_type),
+			frappe.ValidationError,
+		)
+	title = artifact.title or artifact.name
+	data = _render_bytes(artifact.content, title, _normalize_language(artifact.language), format)
+	return _file_payload(data, title, format)
+
+
+def _check_format(format: str) -> None:
+	if format not in _FORMATS:
+		frappe.throw(
+			_("Unsupported export format: {0}. Must be one of {1}.").format(format, ", ".join(_FORMATS)),
+			frappe.ValidationError,
+		)
+
+
+def _file_payload(data: bytes, title: str, format: str) -> dict:
+	import base64
+
+	return {
+		"format": format,
+		"file_name": export_filename(title, format),
+		"mime_type": _MIME_TYPES[format],
+		"size": len(data),
+		"sha256": _sha256(data),
+		"content_base64": base64.b64encode(data).decode("ascii"),
+	}
 
 
 def _render_bytes(content: str, title: str, language: str, format: str) -> bytes:
@@ -203,28 +255,31 @@ def export_document_content(content: str, format: str, language: str = "markdown
 	Stateless like ``preview_document_html``: writes no File row, returns the bytes
 	base64-encoded so the client can save them without a second authenticated fetch.
 	"""
-	import base64
+	return _content_file(content, format, language, title, _("Content is too large to export ({0} KB limit)."))
 
+
+@frappe.whitelist(methods=["POST"])
+def preview_document_file(content: str, format: str, language: str = "markdown", title: str = "") -> dict:
+	"""Format preview for UNSAVED content: the exact bytes Export would save.
+
+	Same renderer, same inputs, same bytes as ``export_document_content``
+	(the DOCX writer is deterministic - fixed zip timestamps - so the two
+	calls hash-equal; ``sha256`` in both payloads lets a client prove it).
+	The client should still save the bytes it previewed rather than calling
+	export again, so what the user saw is what they get by construction.
+	"""
+	return _content_file(content, format, language, title, _("Content is too large to preview ({0} KB limit)."))
+
+
+def _content_file(content: str, format: str, language: str, title: str, too_large_message: str) -> dict:
 	if not content:
 		frappe.throw(_("Content is required"), frappe.ValidationError)
-	if format not in _FORMATS:
-		frappe.throw(
-			_("Unsupported export format: {0}. Must be one of {1}.").format(format, ", ".join(_FORMATS)),
-			frappe.ValidationError,
-		)
+	_check_format(format)
 	if len(content.encode("utf-8")) > _MAX_PREVIEW_CONTENT_BYTES:
-		frappe.throw(
-			_("Content is too large to export ({0} KB limit).").format(_MAX_PREVIEW_CONTENT_BYTES // 1000),
-			frappe.ValidationError,
-		)
+		frappe.throw(too_large_message.format(_MAX_PREVIEW_CONTENT_BYTES // 1000), frappe.ValidationError)
 
 	data = _render_bytes(content, title or _("Untitled document"), _normalize_language(language), format)
-	return {
-		"format": format,
-		"file_name": export_filename(title, format),
-		"mime_type": _MIME_TYPES[format],
-		"content_base64": base64.b64encode(data).decode("ascii"),
-	}
+	return _file_payload(data, title, format)
 
 
 def _delete_existing_export(artifact_name: str, format: str) -> None:
