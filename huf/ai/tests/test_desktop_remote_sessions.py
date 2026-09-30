@@ -1644,7 +1644,16 @@ class TestRunPinBinding(RemoteBase):
 		run = frappe.get_doc("Agent Run", self.run1)
 		run.prompt = "something the desktop user never sent"
 		run.status = "Queued"
-		run.save()
+		# the server now refuses this edit outright (status and prompt of a desktop run are pinned) ...
+		with self.assertRaises(frappe.PermissionError):
+			run.save()
+		# ... and if the row is rewritten underneath it (a DB-level write), the pin no longer binds
+		frappe.db.set_value(
+			"Agent Run",
+			self.run1,
+			{"prompt": "something the desktop user never sent", "status": "Queued"},
+			update_modified=False,
+		)
 		frappe.db.commit()
 		self.assertEqual(self.worker_ctx(self.run1)["origin"], "remote")
 		self.assertEqual(self.tool_ctx(self.run1)["origin"], "remote")
@@ -1733,6 +1742,7 @@ class TestOriginIp(RemoteBase):
 		self.assertEqual(row.ip_address, "203.0.113.7")
 		# the same run, dispatched by the worker (no request any more), sends it in the call
 		frappe.local.request = None
+		frappe.set_user(self.owner)  # the desktop thread runs as the lease owner, not the audit reader
 		call_id = f"call-rs-{frappe.generate_hash(length=10)}"
 		thread, errors, seen = self.play(
 			call_id, [(0.1, "ack", {}), (0.1, "result", {"ok": True, "data": {"content": "ok"}})]
