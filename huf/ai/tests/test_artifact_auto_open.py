@@ -29,6 +29,11 @@ DOC_TAG = '<artifact type="document" title="Board memo">\n# Board memo\n\nAll go
 CODE_TAG = '<artifact type="code" language="python" title="hi">\nprint(1)\n</artifact>'
 
 
+def _pane_calls(publish):
+	"""Only the pane announcements: Frappe itself publishes doc_update/list_update while saving Files."""
+	return [c for c in publish.call_args_list if str(c.kwargs.get("event", "")).startswith("conversation:")]
+
+
 class TestArtifactAutoOpen(unittest.TestCase):
 	def setUp(self):
 		frappe.set_user("Administrator")
@@ -85,8 +90,9 @@ class TestArtifactAutoOpen(unittest.TestCase):
 
 		row = frappe.get_all("Artifact", filters={"message": msg.name}, fields=["name", "artifact_type", "title"])
 		self.assertEqual(len(row), 1)
-		publish.assert_called_once()
-		kwargs = publish.call_args.kwargs
+		calls = _pane_calls(publish)
+		self.assertEqual(len(calls), 1)
+		kwargs = calls[0].kwargs
 		self.assertEqual(kwargs["event"], f"conversation:{self.conversation}")
 		self.assertEqual(kwargs["user"], frappe.db.get_value("Agent Conversation", self.conversation, "owner"))
 		self.assertTrue(kwargs["after_commit"])
@@ -106,13 +112,13 @@ class TestArtifactAutoOpen(unittest.TestCase):
 		frappe.db.delete("Artifact", {"message": msg.name})
 		publish = self._sync(msg)
 		self.assertEqual(frappe.db.count("Artifact", {"message": msg.name}), 1)
-		publish.assert_not_called()
+		self.assertEqual(_pane_calls(publish), [])
 
 	def test_resaving_an_existing_artifact_does_not_announce_again(self):
 		msg = self._message(DOC_TAG)
 		publish = self._sync(msg)  # rows already exist from the insert hook
 		self.assertEqual(frappe.db.count("Artifact", {"message": msg.name}), 1)
-		publish.assert_not_called()
+		self.assertEqual(_pane_calls(publish), [])
 
 	def test_a_realtime_failure_never_blocks_the_save(self):
 		msg = self._message(DOC_TAG)
@@ -129,8 +135,9 @@ class TestArtifactAutoOpen(unittest.TestCase):
 				)
 			)
 		self.assertTrue(result["success"], result)
-		publish.assert_called_once()
-		kwargs = publish.call_args.kwargs
+		calls = _pane_calls(publish)
+		self.assertEqual(len(calls), 1)
+		kwargs = calls[0].kwargs
 		self.assertEqual(kwargs["event"], f"conversation:{self.conversation}")
 		self.assertEqual(kwargs["user"], frappe.session.user)
 		msg = kwargs["message"]
@@ -144,10 +151,10 @@ class TestArtifactAutoOpen(unittest.TestCase):
 		with mock.patch("frappe.publish_realtime") as publish:
 			result = json.loads(handle_export_document(content="# Plan", title="Plan", format="pdf"))
 		self.assertTrue(result["success"], result)
-		publish.assert_not_called()
+		self.assertEqual(_pane_calls(publish), [])
 
 	def test_failed_export_does_not_announce(self):
 		with mock.patch("frappe.publish_realtime") as publish:
 			result = json.loads(handle_export_document(format="pdf", conversation_id=self.conversation))
 		self.assertFalse(result["success"])
-		publish.assert_not_called()
+		self.assertEqual(_pane_calls(publish), [])
