@@ -233,3 +233,27 @@ class TestDocumentExport(unittest.TestCase):
 		self.assertTrue(DOCUMENT_TOOL_NAME.search("export_document"))
 		self.assertIn("export_document", DOCUMENT_EXPORT_TOOL_INSTRUCTIONS)
 		self.assertIn("Do NOT paste", DOCUMENT_EXPORT_TOOL_INSTRUCTIONS)
+
+
+class TestDesktopDocumentGuidance(unittest.TestCase):
+	def test_with_skills_points_at_local_office_skills_and_outputs(self):
+		from huf.ai.document_artifact_instructions import DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_WITH_SKILLS as text
+
+		for needle in ("huf-office", "typst-doc", "docx", "desktop_skill_run", "outputs/", "Activity", "not uploaded"):
+			self.assertIn(needle, text)
+
+	def test_without_skills_says_so_and_does_not_promise_a_file(self):
+		from huf.ai.document_artifact_instructions import DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_NO_SKILLS as text
+
+		self.assertIn("not enabled", text)
+		self.assertIn("Do not pretend", text)
+		self.assertNotIn("desktop_skill_run", text)
+
+	def test_agent_integration_injects_by_skill_tool_presence(self):
+		import inspect
+
+		from huf.ai import agent_integration
+
+		src = inspect.getsource(agent_integration)
+		self.assertIn('"desktop_skill_run" in {tool.name for tool in self.tools}', src)
+		self.assertIn("DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_NO_SKILLS", src)

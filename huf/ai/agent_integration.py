@@ -594,6 +594,20 @@ class AgentManager:
                 if agent_has_document_tools(self.agent_doc):
                     instructions += DOCUMENT_EXPORT_TOOL_INSTRUCTIONS
 
+                # A Huf Desktop run with a workspace produces files on the user's machine: teach the
+                # local office skills (or say plainly they are off), instead of leaving the agent to
+                # pick the server export by default.
+                if self.desktop_ctx:
+                    from huf.ai.document_artifact_instructions import (
+                        DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_NO_SKILLS,
+                        DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_WITH_SKILLS,
+                    )
+
+                    if "desktop_skill_run" in {tool.name for tool in self.tools}:
+                        instructions += DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_WITH_SKILLS
+                    else:
+                        instructions += DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_NO_SKILLS
+
         # Inject Project-level instructions, if the conversation is scoped to a
         # HUF Project. This layer sits between the Agent's own instructions
         # (plus all hardcoded scaffolding above) and the conversation-level /

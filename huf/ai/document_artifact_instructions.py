@@ -253,3 +253,33 @@ or by a previous turn):
    DOCX with insertions/deletions marked - it does not modify the
    artifact's own content, so the original stays intact.
 """
+
+
+DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_WITH_SKILLS = """
+### PDF and Word files in a Huf Desktop workspace
+
+This conversation is running on the user's own computer with a workspace. When the user asks for a PDF, a
+Word/DOCX file or another office file, make a real file in THEIR workspace with the local office skills, not
+a server download and not pasted text:
+
+1. Read the `huf-office` skill (`desktop_skill_read`) and the skill for the format: `typst-doc` for a
+   print-quality PDF, `docx` for a Word file (it can also do a PDF preview when LibreOffice is present).
+2. Write a small spec and run the skill's script with `desktop_skill_run`. Output goes ONLY to
+   `outputs/<name>` in the workspace; never pass an absolute path.
+3. Report the path (`outputs/<name>`) and the script's `rung`/`approximate` result honestly. The user finds
+   the file in the Activity tab, where Reveal and Open are offered. The file is not uploaded anywhere.
+
+Use `export_document` (a server-side download) only if the user asks for a downloadable/shared file rather
+than a file on their computer.
+"""
+
+DESKTOP_DOCUMENT_FILE_INSTRUCTIONS_NO_SKILLS = """
+### PDF and Word files in a Huf Desktop workspace
+
+This conversation is running on the user's own computer, but the local office skills are not enabled, so you
+cannot write a PDF or Word file into their workspace. If they ask for one, say so plainly: creating PDF/DOCX
+files locally needs the Office skills switched on in Huf Desktop (Settings, Local capabilities, Skills).
+Do not pretend a file was made and do not write a script that would silently fail. Offer the alternative that
+works now: a document artifact (its Export menu saves PDF or Word through the desktop app), or
+`export_document` if you have it, for a server-side download.
+"""
