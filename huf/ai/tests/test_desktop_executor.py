@@ -376,6 +376,15 @@ class TestDispatch(DesktopExecutorTestCase):
 		self.assertEqual(cancels[0]["message"]["call_id"], "c-noack")
 		self.assertEqual(cancels[0]["message"]["executor_id"], EXEC_ID)
 
+	def test_s31_dispatch_never_emits_the_web_client_tool_event(self):
+		"""A huf web tab on the same conversation listens for `frontend_tool_call_initiated`
+		(and client_tool_calls in the HTTP response). The desktop channel must use only its own
+		event, so a web dispatcher cannot see, answer or spoil a desktop call."""
+		dx.dispatch("fs.read", {"path": "a"}, self.ctx(), call_id="c-s31", agent_run_id="run-31")
+		events = {c.kwargs.get("event") for c in self.publish.call_args_list}
+		self.assertTrue(all(str(e).startswith("huf_desktop_tool_") for e in events), events)
+		self.assertNotIn("frontend_tool_call_initiated", events)
+
 	def test_publish_payload_scoped_to_lease_user_with_protocol_fields(self):
 		dx.dispatch(
 			"fs.write",
