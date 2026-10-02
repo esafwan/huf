@@ -13,6 +13,7 @@ export type ArtifactType =
 	| 'jsx'
 	| 'chart'
 	| 'video'
+	| 'image'
 	| 'frappe-list'
 	| 'frappe-form'
 	| 'frappe-report';

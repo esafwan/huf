@@ -4,10 +4,12 @@
  * "Download source" as a client Blob.
  */
 
+import { parseUploadedOutput } from '@/utils/uploadedOutput';
+
 export type ServerExportFormat = 'pdf' | 'docx' | 'html';
 
 export interface ExportOption {
-	id: ServerExportFormat | 'source';
+	id: ServerExportFormat | 'source' | 'file';
 	label: string;
 }
 
@@ -33,7 +35,10 @@ export function isDocumentLike(type: string): boolean {
 	return type === 'document' || type === 'markdown';
 }
 
-export function exportOptionsFor(type: string): ExportOption[] {
+export function exportOptionsFor(type: string, content?: string): ExportOption[] {
+	if ((type === 'document' || type === 'image') && parseUploadedOutput(content)) {
+		return [{ id: 'file', label: 'Download file' }];
+	}
 	const source: ExportOption = { id: 'source', label: 'Download source' };
 	if (isDocumentLike(type)) {
 		return [
