@@ -13,6 +13,22 @@ describe('parseUploadedOutput', () => {
 	it.each(['', 'plain text', '{bad', '[]', '{"a":1}', '{"file_url":"javascript:alert(1)"}'])('rejects %s', (c) => {
 		expect(parseUploadedOutput(c)).toBeNull();
 	});
+	it.each([
+		'https://evil.example/x.pdf',
+		'http://evil.example/x.pdf',
+		'//evil.example/x.pdf',
+		'/api/method/foo',
+		'/other/x.pdf',
+		'data:text/html,<b>x</b>',
+		'/files/../private/x',
+		'/files/a\\b',
+		'JAVASCRIPT:alert(1)',
+	])('rejects unsafe file_url %s', (u) => {
+		expect(parseUploadedOutput(JSON.stringify({ file_url: u }))).toBeNull();
+	});
+	it('accepts /files/ and /private/files/', () => {
+		expect(parseUploadedOutput('{"file_url":"/files/a.png"}')?.fileUrl).toBe('/files/a.png');
+	});
 	it('falls back filename to url tail', () => {
 		expect(parseUploadedOutput('{"file_url":"/private/files/x.png"}')?.filename).toBe('x.png');
 	});

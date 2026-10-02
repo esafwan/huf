@@ -26,8 +26,8 @@ ALLOWED = {
 	"html": ("text/html", "html", None, True),
 	"json": ("application/json", "text", None, True),
 }
-SECRET_NAME = re.compile(r"(^|[._-])(id_rsa|id_ed25519|credentials?|secrets?|passwd|netrc|npmrc|token|apikey|api_key)([._-]|$)", re.I)
-SECRET_EXT = {"pem", "key", "p12", "pfx", "env", "kdbx", "gpg", "asc"}
+SECRET_NAME = re.compile(r"(^|[._-])(id_rsa|id_ed25519|id_ecdsa|id_dsa|shadow|pypirc|keychain|credentials?|secrets?|passwd|netrc|npmrc|token|apikey|api_key)([._-]|$)", re.I)
+SECRET_EXT = {"pem", "key", "p12", "pfx", "jks", "keystore", "keychain", "env", "kdbx", "gpg", "asc"}
 
 
 class UploadRejected(ValueError):

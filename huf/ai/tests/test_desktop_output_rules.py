@@ -46,6 +46,14 @@ class TestValidate(unittest.TestCase):
 		self.assertEqual(r.clean_filename("dir/sub\\x.txt"), "x.txt")
 
 
+class TestSecretNames(unittest.TestCase):
+	def test_more_secret_names(self):
+		for name in ("id_ecdsa", "id_ecdsa.txt", "shadow.txt", "pypirc.txt", "login.keychain", "a.p12", "a.pfx", "a.jks", "a.keystore"):
+			with self.assertRaises(r.UploadRejected, msg=name) as cm:
+				r.validate_upload(name, b64(b"x"))
+			self.assertEqual(cm.exception.code, "secret_name", name)
+
+
 class TestRank(unittest.TestCase):
 	items = [
 		{"kind": "skill", "name": "docx", "description": "Word documents"},

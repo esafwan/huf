@@ -12,6 +12,14 @@ export interface UploadedOutput {
 
 export type UploadedKind = 'image' | 'pdf' | 'word' | 'sheet' | 'slides' | 'file';
 
+/** Only same-origin Frappe file paths; never external, protocol-relative or javascript: URLs. */
+export function isSafeFileUrl(url: string): boolean {
+	if (!(url.startsWith('/private/files/') || url.startsWith('/files/'))) return false;
+	// eslint-disable-next-line no-control-regex
+	if (/[\x00-\x1f\\]/.test(url) || url.includes('..')) return false;
+	return true;
+}
+
 export function parseUploadedOutput(content: string | undefined | null): UploadedOutput | null {
 	if (!content || content.charCodeAt(0) !== 123 /* { */) return null;
 	let raw: unknown;
@@ -24,8 +32,7 @@ export function parseUploadedOutput(content: string | undefined | null): Uploade
 	const o = raw as Record<string, unknown>;
 	if (typeof o.file_url !== 'string' || !o.file_url) return null;
 	const fileUrl = o.file_url;
-	// Only same-origin style paths or http(s); never javascript: etc.
-	if (!/^(\/|https?:\/\/)/i.test(fileUrl)) return null;
+	if (!isSafeFileUrl(fileUrl)) return null;
 	return {
 		fileUrl,
 		filename: typeof o.filename === 'string' && o.filename ? o.filename : fileUrl.split('/').pop() || 'file',
