@@ -11,6 +11,8 @@ import { getArtifactIcon } from '@/components/chat/ArtifactsPanel';
 import { ExportMenu } from '@/components/chat/artifacts/ExportMenu';
 import { useArtifactPaneContext } from '@/components/chat/artifacts/ArtifactPaneContext';
 import { sameTarget, type ParsedArtifactTarget } from '@/components/chat/useArtifactPane';
+import { uploadedIcon } from '@/components/chat/UploadedOutputView';
+import { parseUploadedOutput } from '@/utils/uploadedOutput';
 import { artifactSubtitle } from '@/utils/artifactClass';
 import { findDurableArtifact, parsedArtifactKey } from '@/utils/artifactIdentity';
 import { shouldAutoOpen } from '@/utils/streamingArtifact';
@@ -57,7 +59,10 @@ export function ArtifactCard({ artifact, messageId, ordinal, indexInMessage }: A
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
 
-	const Icon = getArtifactIcon(artifact.type === 'react-component' ? 'code' : artifact.type);
+	const uploaded = parseUploadedOutput(artifact.content);
+	const Icon = uploaded
+		? uploadedIcon(uploaded)
+		: getArtifactIcon(artifact.type === 'react-component' ? 'code' : artifact.type);
 
 	const handleClick = () => {
 		if (!ctx) return;
@@ -88,7 +93,7 @@ export function ArtifactCard({ artifact, messageId, ordinal, indexInMessage }: A
 			</div>
 			<div className="min-w-0 flex-1">
 				<div className="truncate text-[13px] font-medium text-ink">
-					{artifact.title || `${artifact.type} artifact`}
+					{artifact.title || uploaded?.filename || `${artifact.type} artifact`}
 				</div>
 				<div className="truncate text-[12px] text-steel">{artifactSubtitle(artifact)}</div>
 			</div>

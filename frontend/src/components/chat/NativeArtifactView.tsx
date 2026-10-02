@@ -11,6 +11,8 @@ import { DocumentPreview } from '@/components/chat/DocumentPreview';
 import { FrappeListView } from '@/components/chat/frappe-views/FrappeListView';
 import { FrappeFormView } from '@/components/chat/frappe-views/FrappeFormView';
 import { FrappeReportView } from '@/components/chat/frappe-views/FrappeReportView';
+import { UploadedOutputView } from '@/components/chat/UploadedOutputView';
+import { parseUploadedOutput } from '@/utils/uploadedOutput';
 import type { FrappeViewPayload, ParsedArtifact } from '@/types/artifact.types';
 
 /** Ids minted by the client-side parser for transient, unsaved artifacts. */
@@ -97,6 +99,8 @@ function renderFrappeView(type: 'frappe-list' | 'frappe-form' | 'frappe-report',
 }
 
 export function NativeArtifactView({ artifact }: { artifact: ParsedArtifact }) {
+	const uploaded = artifact.type === 'document' || artifact.type === 'image' ? parseUploadedOutput(artifact.content) : null;
+	if (uploaded) return <UploadedOutputView output={uploaded} />;
 	switch (artifact.type) {
 		case 'code':
 		case 'react-component':

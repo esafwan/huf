@@ -14,6 +14,7 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { exportArtifact } from '@/services/artifactApi';
+import { parseUploadedOutput } from '@/utils/uploadedOutput';
 import { downloadSource, exportOptionsFor, type ExportOption } from '@/utils/artifactExport';
 
 export interface ExportMenuProps {
@@ -25,10 +26,15 @@ export interface ExportMenuProps {
 
 export function ExportMenu({ artifact, durableName, className }: ExportMenuProps) {
 	const [busy, setBusy] = useState(false);
-	const options = exportOptionsFor(artifact.type);
+	const options = exportOptionsFor(artifact.type, artifact.content);
 	if (options.length === 0) return null;
 
 	const run = async (option: ExportOption) => {
+		if (option.id === 'file') {
+			const up = parseUploadedOutput(artifact.content);
+			if (up) window.open(up.fileUrl, '_blank', 'noopener');
+			return;
+		}
 		if (option.id === 'source') {
 			downloadSource(artifact);
 			return;
@@ -64,7 +70,7 @@ export function ExportMenu({ artifact, durableName, className }: ExportMenuProps
 				{options.map((option) => (
 					<DropdownMenuItem
 						key={option.id}
-						disabled={option.id !== 'source' && !durableName}
+						disabled={option.id !== 'source' && option.id !== 'file' && !durableName}
 						onSelect={() => void run(option)}
 					>
 						{option.label}

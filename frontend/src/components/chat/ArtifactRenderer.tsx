@@ -55,6 +55,7 @@ const ARTIFACT_ICONS: Record<ArtifactType, typeof CodeIcon> = {
 	document: FileTextIcon,
 	html: LayoutIcon,
 	svg: ImageIcon,
+	image: ImageIcon,
 	mermaid: LayoutIcon,
 	'react-component': CodeIcon,
 	markdown: FileTextIcon,
