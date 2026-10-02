@@ -1136,6 +1136,14 @@ class TestCallIdentityAndReruns(DesktopExecutorTestCase):
 		self.assertEqual(res["error"]["code"], "already_dispatched")
 		self.publish.assert_not_called()
 
+	def test_a_failed_ledger_write_refuses_a_mutating_call(self):
+		with mock.patch.object(dx, "_ledger_put", return_value=False):
+			res = dx.dispatch(
+				"fs.write", {"path": "a", "content": "x"}, self.ctx(), call_id="tc-F1", agent_run_id="AR-L7"
+			)
+		self.assertEqual(res["error"]["code"], "cache_unavailable")
+		self.publish.assert_not_called()
+
 	def test_without_a_rerun_identical_mutations_run_normally(self):
 		params = {"path": "a", "content": "x"}
 		self._run_mutation("AR-L5", "tc-1", params, {"written": 1})

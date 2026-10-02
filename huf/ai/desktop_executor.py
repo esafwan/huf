@@ -966,15 +966,18 @@ def _ledger_get(agent_run_id, call_id):
 
 
 def _ledger_put(agent_run_id, call_id, entry):
+	"""Record a ledger entry. Returns False when the write failed (callers decide whether to fail closed)."""
 	if not agent_run_id:
-		return
+		return True
 	try:
 		r = _raw_client()
 		lk = _k(_ledger_key(agent_run_id))
 		r.hset(lk, call_id, json.dumps(entry, default=str))
 		r.expire(lk, LEDGER_TTL_S)
+		return True
 	except Exception:
 		_log_failure("desktop_executor: ledger write failed")
+		return False
 
 
 def _ledger_entries(key, strict=False):
@@ -1330,7 +1333,14 @@ def dispatch(
 				"timeout_ms": timeout_ms,
 				"approval_timeout_ms": APPROVAL_TIMEOUT_MS,
 			}
-			_ledger_put(agent_run_id, call_id, {"sig": sig, "op": op, "at": issued_at, "final": None})
+			if not _ledger_put(agent_run_id, call_id, {"sig": sig, "op": op, "at": issued_at, "final": None}) and (
+				op in MUTATING_OPS
+			):
+				# Fail closed: without the started-call record a killed worker's re-run could
+				# execute this mutation twice, so it is not published at all.
+				return _error(
+					op, label, "cache_unavailable", "Could not dispatch the tool call (cache unavailable)."
+				)
 			try:
 				_setex(
 					_request_key(call_id),
