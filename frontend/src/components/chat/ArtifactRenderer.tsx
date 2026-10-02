@@ -17,10 +17,11 @@ import {
 	ArtifactClose,
 } from '@/components/ai-elements/artifact';
 import { CodeBlock } from '@/components/ai-elements/code-block';
+import { NativeArtifactView, normalizeLanguage, isDurableArtifactId } from '@/components/chat/NativeArtifactView';
+import { ExportMenu } from '@/components/chat/artifacts/ExportMenu';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
 	CopyIcon,
-	DownloadIcon,
 	MaximizeIcon,
 	MinimizeIcon,
 	CheckIcon,
@@ -36,27 +37,7 @@ import type { ParsedArtifact, ArtifactType } from '@/types/artifact.types';
 import type { ParsedMessageContent } from '@/utils/messageContentParser';
 import { writePreviewCache } from '@/utils/previewCache';
 import { cn } from '@/lib/utils';
-import { Mermaid } from '@/components/ui/mermaid';
-import { JSXPreview, JSXPreviewContent, JSXPreviewExport } from '@/components/ui/jsx-preview';
-import { Video } from '@/components/ai-elements/video';
-import { DocumentPreview } from '@/components/chat/DocumentPreview';
-import { FrappeListView } from '@/components/chat/frappe-views/FrappeListView';
-import { FrappeFormView } from '@/components/chat/frappe-views/FrappeFormView';
-import { FrappeReportView } from '@/components/chat/frappe-views/FrappeReportView';
-import type { FrappeViewPayload } from '@/types/artifact.types';
 import { TableIcon } from 'lucide-react';
-
-/** Ids minted by the client-side parser for transient, unsaved artifacts. */
-const TRANSIENT_ARTIFACT_ID = /^artifact-\d+-\d+$/;
-
-/**
- * True when an id refers to a durable, server-owned Artifact row rather than a
- * throwaway id created while parsing message content in the browser. Only
- * durable artifacts can be fetched by name from the server.
- */
-function isDurableArtifactId(id: string | undefined): id is string {
-	return Boolean(id) && !TRANSIENT_ARTIFACT_ID.test(id as string);
-}
 
 interface ArtifactRendererProps {
 	artifact: ParsedArtifact;
@@ -85,77 +66,6 @@ const ARTIFACT_ICONS: Record<ArtifactType, typeof CodeIcon> = {
 	'frappe-report': TableIcon,
 };
 
-// Map common language aliases to Shiki language names
-const LANGUAGE_MAP: Record<string, string> = {
-	js: 'javascript',
-	ts: 'typescript',
-	py: 'python',
-	rb: 'ruby',
-	yml: 'yaml',
-	sh: 'bash',
-	shell: 'bash',
-	zsh: 'bash',
-	dockerfile: 'docker',
-	md: 'markdown',
-	txt: 'text',
-	text: 'text',
-};
-
-function normalizeLanguage(language?: string): string {
-	if (!language) return 'text';
-	const lower = language.toLowerCase();
-	return LANGUAGE_MAP[lower] || lower;
-}
-
-/**
- * Parses a frappe-list/frappe-form/frappe-report artifact body (JSON per
- * FrappeViewPayload, emitted by
- * huf/ai/tools/frappe_generic.py::handle_render_frappe_view) and renders the
- * matching view component. Malformed JSON (or a payload missing the fields
- * these views need) falls back to a plain error message rather than
- * throwing, since this runs inside a streaming chat message.
- */
-function renderFrappeView(type: 'frappe-list' | 'frappe-form' | 'frappe-report', content: string) {
-	let payload: FrappeViewPayload;
-	try {
-		payload = JSON.parse(content) as FrappeViewPayload;
-	} catch (error) {
-		console.error('Failed to parse frappe view artifact payload:', error);
-		return (
-			<div className="text-sm text-destructive p-4">
-				Could not parse this Frappe view - invalid JSON.
-			</div>
-		);
-	}
-
-	// Defensive normalization: a model asked to relay the tool's artifact tag
-	// "verbatim" can still occasionally paraphrase a key name (observed:
-	// gemini-3.6-flash emitting `doc` instead of `data` for mode="form"
-	// while otherwise reproducing the payload faithfully). Recover the
-	// common single-key-rename case rather than showing a hard error for
-	// data that's actually all there.
-	if (payload && payload.data === undefined && (payload as unknown as Record<string, unknown>).doc !== undefined) {
-		payload = { ...payload, data: (payload as unknown as Record<string, unknown>).doc } as FrappeViewPayload;
-	}
-
-	if (!payload || !payload.meta || payload.data === undefined) {
-		return (
-			<div className="text-sm text-destructive p-4">
-				This Frappe view is missing required data (meta/data).
-			</div>
-		);
-	}
-
-	switch (type) {
-		case 'frappe-list':
-			return <FrappeListView payload={payload} />;
-		case 'frappe-form':
-			return <FrappeFormView payload={payload} />;
-		case 'frappe-report':
-			return <FrappeReportView payload={payload} />;
-	}
-}
-
 export function ArtifactRenderer({
 	artifact,
 	onClose,
@@ -177,62 +87,6 @@ export function ArtifactRenderer({
 		}
 	}, [artifact.content]);
 
-	const handleDownload = useCallback(() => {
-		const blob = new Blob([artifact.content], { type: 'text/plain' });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		a.href = url;
-
-		// Determine file extension based on type and language
-		let extension = 'txt';
-		if (artifact.type === 'code' && artifact.language) {
-			const langMap: Record<string, string> = {
-				javascript: 'js',
-				typescript: 'ts',
-				python: 'py',
-				ruby: 'rb',
-				rust: 'rs',
-				golang: 'go',
-				go: 'go',
-				java: 'java',
-				csharp: 'cs',
-				cpp: 'cpp',
-				c: 'c',
-				html: 'html',
-				css: 'css',
-				json: 'json',
-				yaml: 'yml',
-				markdown: 'md',
-				sql: 'sql',
-				bash: 'sh',
-				shell: 'sh',
-			};
-			extension = langMap[artifact.language.toLowerCase()] || artifact.language;
-		} else if (artifact.type === 'html') {
-			extension = 'html';
-		} else if (artifact.type === 'svg') {
-			extension = 'svg';
-		} else if (artifact.type === 'mermaid') {
-			extension = 'mmd';
-		} else if (artifact.type === 'markdown' || artifact.type === 'document') {
-			extension = 'md';
-		} else if (artifact.type === 'jsx' || artifact.type === 'chart') {
-			extension = 'jsx';
-		} else if (
-			artifact.type === 'frappe-list' ||
-			artifact.type === 'frappe-form' ||
-			artifact.type === 'frappe-report'
-		) {
-			extension = 'json';
-		}
-
-		a.download = artifact.title
-			? `${artifact.title.replace(/[^a-z0-9]/gi, '_')}.${extension}`
-			: `artifact.${extension}`;
-		a.click();
-		URL.revokeObjectURL(url);
-	}, [artifact]);
-
 	const toggleFullscreen = useCallback(() => {
 		setIsFullscreen((prev) => !prev);
 	}, []);
@@ -252,137 +106,16 @@ export function ArtifactRenderer({
 		window.open(`/huf/view/${messageId}`, '_blank', 'noopener');
 	}, [messageId, previewContent, artifact]);
 
-	const renderSource = () => (
-		<CodeBlock
-			code={artifact.content}
-			language={normalizeLanguage(artifact.language)}
-			showLineNumbers
-		/>
-	);
-
-	const renderContent = () => {
-		if (view === 'source') {
-			return renderSource();
-		}
-		switch (artifact.type) {
-			case 'code':
-			case 'react-component':
-				return (
-					<CodeBlock
-						code={artifact.content}
-						language={normalizeLanguage(artifact.language)}
-						showLineNumbers
-					/>
-				);
-
-			case 'html':
-				return (
-					<div className="flex flex-col gap-2">
-						<iframe
-							srcDoc={artifact.content}
-							sandbox=""
-							className="w-full h-96 border rounded bg-panel"
-							title={artifact.title || 'HTML Preview'}
-						/>
-						<details className="text-xs">
-							<summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-								View source
-							</summary>
-							<CodeBlock code={artifact.content} language="html" />
-						</details>
-					</div>
-				);
-
-			case 'svg':
-				return (
-					<div className="flex flex-col gap-2">
-						<iframe
-							srcDoc={artifact.content}
-							sandbox=""
-							className="flex items-center justify-center p-4 bg-panel rounded border"
-							title={artifact.title || 'SVG Preview'}
-						/>
-						<details className="text-xs">
-							<summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-								View source
-							</summary>
-							<CodeBlock code={artifact.content} language="xml" />
-						</details>
-					</div>
-				);
-
-			case 'mermaid':
-				return (
-					<div className="flex flex-col gap-2">
-						<Mermaid chart={artifact.content} />
-						<details className="text-xs">
-							<summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-								View source
-							</summary>
-							<CodeBlock code={artifact.content} language="mermaid" />
-						</details>
-					</div>
-				);
-
-			case 'video': {
-				const src = artifact.content.trim();
-				return <Video src={src} title={artifact.title} className="max-w-full" />;
-			}
-
-			case 'markdown':
-			case 'document':
-				// A DURABLE (server-owned) artifact is previewed by name via
-				// get_artifact_html. In chat, most of these objects come from the
-				// client-side parser instead, which mints throwaway ids of the
-				// form `artifact-<timestamp>-<index>` (artifactParser.ts) - those
-				// match no Artifact row. Rather than falling back to raw
-				// <MessageResponse> (which prints an HTML document's <style>
-				// block as literal text, see the bug this fixes), render those
-				// through preview_document_html by sending the content directly.
-				return isDurableArtifactId(artifact.id) ? (
-					<DocumentPreview artifactName={artifact.id} />
-				) : (
-					<DocumentPreview
-						content={artifact.content}
-						language={artifact.language}
-						title={artifact.title}
-					/>
-				);
-
-			case 'jsx':
-			case 'chart':
-				return (
-					<div className="flex flex-col gap-2">
-						<JSXPreview jsx={artifact.content} className="min-h-[300px]">
-							<div className="absolute top-2 right-2 z-10">
-								<JSXPreviewExport filename={artifact.title?.replace(/[^a-z0-9]/gi, '_') || 'chart'} />
-							</div>
-							<div className="pt-10">
-								<JSXPreviewContent />
-							</div>
-						</JSXPreview>
-						<details className="text-xs">
-							<summary className="cursor-pointer text-muted-foreground hover:text-foreground">
-								View source
-							</summary>
-							<CodeBlock code={artifact.content} language="jsx" />
-						</details>
-					</div>
-				);
-
-			case 'frappe-list':
-			case 'frappe-form':
-			case 'frappe-report':
-				return renderFrappeView(artifact.type, artifact.content);
-
-			default:
-				return (
-					<pre className="whitespace-pre-wrap text-sm font-mono p-4 bg-muted/50 rounded">
-						{artifact.content}
-					</pre>
-				);
-		}
-	};
+	const renderContent = () =>
+		view === 'source' ? (
+			<CodeBlock
+				code={artifact.content}
+				language={normalizeLanguage(artifact.language)}
+				showLineNumbers
+			/>
+		) : (
+			<NativeArtifactView artifact={artifact} />
+		);
 
 	const Icon = ARTIFACT_ICONS[artifact.type] || CodeIcon;
 
@@ -432,11 +165,9 @@ export function ArtifactRenderer({
 						label="Copy content"
 						onClick={handleCopy}
 					/>
-					<ArtifactAction
-						icon={DownloadIcon}
-						tooltip="Download"
-						label="Download file"
-						onClick={handleDownload}
+					<ExportMenu
+						artifact={artifact}
+						durableName={isDurableArtifactId(artifact.id) ? artifact.id : undefined}
 					/>
 					<ArtifactAction
 						icon={isFullscreen ? MinimizeIcon : MaximizeIcon}

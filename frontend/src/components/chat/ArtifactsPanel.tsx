@@ -15,7 +15,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { formatTimeAgo } from '@/utils/time';
 import { exportArtifactFromPanel, type ArtifactListItem } from '@/services/artifactPanelApi';
-import type { ArtifactPaneTarget } from '@/components/chat/useArtifactPane';
+import { durableTarget, type ArtifactPaneTarget } from '@/components/chat/useArtifactPane';
 
 const COLLAPSED_STORAGE_KEY = 'huf-artifacts-panel-collapsed';
 
@@ -189,11 +189,7 @@ export function ArtifactsPanel({ artifacts, loading, onOpenArtifact }: Artifacts
                       <button
                         type="button"
                         onClick={() =>
-                          onOpenArtifact({
-                            name: artifact.name,
-                            title: artifact.title,
-                            artifact_type: artifact.artifact_type,
-                          })
+                          onOpenArtifact(durableTarget(artifact))
                         }
                         className="flex items-start gap-2 min-w-0 flex-1 text-left"
                       >

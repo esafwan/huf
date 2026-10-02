@@ -6,7 +6,7 @@
  */
 import type { LucideIcon } from 'lucide-react';
 import { getArtifactIcon } from '@/components/chat/ArtifactsPanel';
-import type { ArtifactPaneTarget } from '@/components/chat/useArtifactPane';
+import { durableTarget, type ArtifactPaneTarget } from '@/components/chat/useArtifactPane';
 import type { ArtifactListItem } from '@/services/artifactPanelApi';
 import { cn } from '@/lib/utils';
 
@@ -35,11 +35,7 @@ export function OutputsCard({ artifacts, onOpenArtifact, activeArtifactName }: O
             key={artifact.name}
             type="button"
             onClick={() =>
-              onOpenArtifact({
-                name: artifact.name,
-                title: artifact.title,
-                artifact_type: artifact.artifact_type,
-              })
+              onOpenArtifact(durableTarget(artifact))
             }
             className={cn(
               'flex h-chat-row w-full items-center gap-2 rounded-sm px-1 text-left text-[13px]',

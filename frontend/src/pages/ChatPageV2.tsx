@@ -1,9 +1,11 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { ChatShellFrame } from "@/components/chat/rail/ChatShellFrame";
 import ChatWindow from "@/components/chat/ChatWindowV2";
 import { ArtifactPreviewPane } from "@/components/chat/artifacts/ArtifactPreviewPane";
-import { useArtifactPane } from "@/components/chat/useArtifactPane";
+import { useArtifactPane, durableTarget, targetDurableName } from "@/components/chat/useArtifactPane";
+import { ArtifactPaneProvider } from "@/components/chat/artifacts/ArtifactPaneContext";
+import { readAutoOpenPref } from "@/utils/streamingArtifact";
 import { useConversationArtifacts } from "@/components/chat/useConversationArtifacts";
 import { useChatSocket, type OpenArtifactPaneEvent } from "@/hooks/useChatSocket";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -25,6 +27,8 @@ function ChatPage() {
     const toggleSidebar = useCallback(() => setSidebarOpen((prev) => !prev), []);
     const artifactPane = useArtifactPane();
     const analyticsPane = useConversationAnalyticsPane();
+    // Auto-open the pane on the first artifact of a turn (default on).
+    const [autoOpenArtifacts] = useState<boolean>(readAutoOpenPref);
     // Which of the two right-pane tenants is currently on screen. Both can be
     // "open" (loaded, data fetched) at once — see useConversationAnalyticsPane
     // and useArtifactPane — but the slot only ever shows one at a time. This
@@ -44,7 +48,7 @@ function ChatPage() {
 
             const known = conversationArtifacts.find((a) => a.name === event.artifact_id);
             if (known) {
-                artifactPane.open({ name: known.name, title: known.title, artifact_type: known.artifact_type });
+                artifactPane.open(durableTarget(known));
                 return;
             }
 
@@ -53,11 +57,40 @@ function ChatPage() {
             const refreshed = await refetchArtifacts();
             const found = refreshed.find((a) => a.name === event.artifact_id);
             if (found) {
-                artifactPane.open({ name: found.name, title: found.title, artifact_type: found.artifact_type });
+                artifactPane.open(durableTarget(found));
             }
         },
         [isMobile, chatId, conversationArtifacts, refetchArtifacts, artifactPane.open]
     );
+
+    // Cards open/hide through these so the shared right slot also switches
+    // to the artifact tenant, and the list refreshes when a card's durable
+    // row isn't known yet (it is saved server-side after the message).
+    const openFromCard = useCallback(
+        (target: Parameters<typeof artifactPane.open>[0]) => {
+            artifactPane.open(target);
+            setVisibleRightPane("artifact");
+            if (target.kind === "parsed" && !target.durableName) void refetchArtifacts();
+        },
+        [artifactPane.open, refetchArtifacts]
+    );
+    const toggleFromCard = useCallback(
+        (target: Parameters<typeof artifactPane.open>[0]) => {
+            artifactPane.toggle(target);
+            setVisibleRightPane("artifact");
+            if (target.kind === "parsed" && !target.durableName) void refetchArtifacts();
+        },
+        [artifactPane.toggle, refetchArtifacts]
+    );
+
+    // A parsed target opened before its durable row existed gains the row's
+    // name once the list refetch lands (enables server exports).
+    const paneTarget = useMemo(() => {
+        const t = artifactPane.currentArtifact;
+        if (!t || t.kind !== "parsed" || t.durableName) return t;
+        const match = conversationArtifacts.find((a) => `${a.message}:${a.message_index}` === t.key);
+        return match ? { ...t, durableName: match.name } : t;
+    }, [artifactPane.currentArtifact, conversationArtifacts]);
 
     useChatSocket({
         conversationId: chatId,
@@ -105,7 +138,7 @@ function ChatPage() {
         if (!artifactPane.isOpen) {
             const first = conversationArtifacts[0];
             if (first) {
-                artifactPane.open({ name: first.name, title: first.title, artifact_type: first.artifact_type });
+                artifactPane.open(durableTarget(first));
             } else {
                 return;
             }
@@ -179,7 +212,7 @@ function ChatPage() {
                         )}
                         {effectiveVisiblePane === "artifact" ? (
                             <ArtifactPreviewPane
-                                artifact={artifactPane.currentArtifact}
+                                artifact={paneTarget}
                                 onClose={artifactPane.close}
                                 width={artifactPane.width}
                                 onWidthChange={artifactPane.setWidth}
@@ -198,6 +231,14 @@ function ChatPage() {
                 ) : null
             }
         >
+            <ArtifactPaneProvider
+                activeTarget={paneTarget}
+                durableArtifacts={conversationArtifacts}
+                isMobile={isMobile}
+                autoOpen={autoOpenArtifacts}
+                open={openFromCard}
+                toggle={toggleFromCard}
+            >
             <ChatWindow
                 chatId={chatId}
                 onConversationCreated={handleConversationCreated}
@@ -212,10 +253,11 @@ function ChatPage() {
                 }
                 artifacts={conversationArtifacts}
                 onOpenArtifact={artifactPane.open}
-                activeArtifactName={artifactPane.currentArtifact?.name}
+                activeArtifactName={artifactPane.currentArtifact ? targetDurableName(artifactPane.currentArtifact) : undefined}
                 analyticsPaneOpen={analyticsAvailable}
                 onToggleAnalyticsPane={!isMobile && chatId ? handleToggleAnalyticsPane : undefined}
             />
+            </ArtifactPaneProvider>
         </ChatShellFrame>
     );
 }
