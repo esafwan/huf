@@ -1,17 +1,77 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useReducer, useState } from 'react';
+import type { ParsedArtifact } from '@/types/artifact.types';
 
-/**
- * Minimal identity needed to preview a durable document artifact in the
- * right-docked pane. Mirrors the subset of `ArtifactListItem`
- * (see artifactPanelApi.ts) that `DocumentPreview` and the pane header need —
- * kept separate so callers other than `ArtifactsPanel` (e.g. a future
- * artifact card in the message stream) can open the pane without importing
- * the panel's list-row type.
- */
-export interface ArtifactPaneTarget {
+/** A durable (server-owned) artifact row, addressed by its Artifact name. */
+export interface DurableArtifactTarget {
+  kind: 'durable';
   name: string;
   title?: string;
   artifact_type: string;
+}
+
+/**
+ * An artifact parsed from a message in the browser. Carries its content so it
+ * can open before/without a durable row; `durableName` links it to the row
+ * when the (message, ordinal) lookup found one (needed for server exports).
+ */
+export interface ParsedArtifactTarget {
+  kind: 'parsed';
+  key: string;
+  artifact: ParsedArtifact;
+  durableName?: string;
+}
+
+export type ArtifactPaneTarget = DurableArtifactTarget | ParsedArtifactTarget;
+
+export function durableTarget(item: {
+  name: string;
+  title?: string;
+  artifact_type: string;
+}): DurableArtifactTarget {
+  return { kind: 'durable', name: item.name, title: item.title, artifact_type: item.artifact_type };
+}
+
+export function targetTitle(t: ArtifactPaneTarget): string | undefined {
+  return t.kind === 'durable' ? t.title : t.artifact.title;
+}
+
+export function targetType(t: ArtifactPaneTarget): string {
+  return t.kind === 'durable' ? t.artifact_type : t.artifact.type;
+}
+
+export function targetDurableName(t: ArtifactPaneTarget): string | undefined {
+  return t.kind === 'durable' ? t.name : t.durableName;
+}
+
+/** True when both targets point at the same artifact (parsed targets match their durable row). */
+export function sameTarget(a: ArtifactPaneTarget | null, b: ArtifactPaneTarget | null): boolean {
+  if (!a || !b) return false;
+  if (a.kind === 'durable' && b.kind === 'durable') return a.name === b.name;
+  if (a.kind === 'parsed' && b.kind === 'parsed') {
+    return a.key === b.key || (!!a.durableName && a.durableName === b.durableName);
+  }
+  const parsed = a.kind === 'parsed' ? a : (b as ParsedArtifactTarget);
+  const durable = a.kind === 'durable' ? a : (b as DurableArtifactTarget);
+  return parsed.durableName === durable.name;
+}
+
+export type PaneAction =
+  | { type: 'open'; target: ArtifactPaneTarget }
+  | { type: 'toggle'; target: ArtifactPaneTarget }
+  | { type: 'close' };
+
+export function paneReducer(
+  state: ArtifactPaneTarget | null,
+  action: PaneAction
+): ArtifactPaneTarget | null {
+  switch (action.type) {
+    case 'open':
+      return action.target;
+    case 'toggle':
+      return sameTarget(state, action.target) ? null : action.target;
+    case 'close':
+      return null;
+  }
 }
 
 const WIDTH_STORAGE_KEY = 'huf-artifact-pane-width';
@@ -47,6 +107,8 @@ export interface UseArtifactPaneResult {
   isOpen: boolean;
   currentArtifact: ArtifactPaneTarget | null;
   open: (artifact: ArtifactPaneTarget) => void;
+  /** Opens the target, or closes the pane when it is already showing it (card Open/Hide). */
+  toggle: (artifact: ArtifactPaneTarget) => void;
   close: () => void;
   /** Pane width in pixels, clamped to [30vw, 75vw] and persisted to localStorage. */
   width: number;
@@ -64,15 +126,19 @@ export interface UseArtifactPaneResult {
  * trigger the pane (currently `ArtifactsPanel`'s list rows).
  */
 export function useArtifactPane(): UseArtifactPaneResult {
-  const [currentArtifact, setCurrentArtifact] = useState<ArtifactPaneTarget | null>(null);
+  const [currentArtifact, dispatch] = useReducer(paneReducer, null);
   const [width, setWidthState] = useState<number>(readStoredWidth);
 
   const open = useCallback((artifact: ArtifactPaneTarget) => {
-    setCurrentArtifact(artifact);
+    dispatch({ type: 'open', target: artifact });
+  }, []);
+
+  const toggle = useCallback((artifact: ArtifactPaneTarget) => {
+    dispatch({ type: 'toggle', target: artifact });
   }, []);
 
   const close = useCallback(() => {
-    setCurrentArtifact(null);
+    dispatch({ type: 'close' });
   }, []);
 
   const setWidth = useCallback((px: number) => {
@@ -89,6 +155,7 @@ export function useArtifactPane(): UseArtifactPaneResult {
     isOpen: currentArtifact !== null,
     currentArtifact,
     open,
+    toggle,
     close,
     width,
     setWidth,
