@@ -50,7 +50,13 @@ def upload_desktop_output(
 		or conv.execution_host != "desktop"
 		or conv.host_device_id != lease.get("device_id")
 	):
-		_deny(_("This conversation is not hosted by this desktop."))
+		# Same result for a missing and for someone else's conversation (no existence leak); the lease is valid so
+		# this is a terminal per-conversation outcome, not an auth failure.
+		return {
+			"ok": False,
+			"code": "not_hosted",
+			"message": _("This conversation is not hosted by this desktop."),
+		}
 	try:
 		name, ext, content_type, artifact_type, data, text = rules.validate_upload(filename, content_b64)
 	except rules.UploadRejected as e:

@@ -70,6 +70,10 @@ class TestUploadDesktopOutput(RemoteBase):
 		with self.assertRaises(frappe.PermissionError):
 			self.up()
 
+	def assert_not_hosted(self, r):
+		self.assertEqual(r["ok"], False)
+		self.assertEqual(r["code"], "not_hosted")
+
 	def test_conversation_not_hosted_by_device(self):
 		frappe.set_user(self.owner)
 		web = frappe.get_doc(
@@ -83,18 +87,18 @@ class TestUploadDesktopOutput(RemoteBase):
 		web.insert(ignore_permissions=True)
 		self.track_conversation(web.name)
 		for conv in (web.name, "does-not-exist", None):
-			with self.assertRaises(frappe.PermissionError, msg=conv):
-				self.up(conversation=conv)
+			self.assert_not_hosted(self.up(conversation=conv))
 		# a desktop conversation hosted by a different device
 		frappe.db.set_value("Agent Conversation", self.conv, "host_device_id", "0" * 16)
-		with self.assertRaises(frappe.PermissionError):
-			self.up()
+		self.assert_not_hosted(self.up())
 
 	def test_other_users_conversation(self):
 		frappe.set_user("Administrator")
 		frappe.db.set_value("Agent Conversation", self.conv, "owner", self.other)
-		with self.assertRaises(frappe.PermissionError):
-			self.up()
+		someone_else = self.up()
+		self.assert_not_hosted(someone_else)
+		# indistinguishable from a conversation that does not exist (no existence leak)
+		self.assertEqual(someone_else, self.up(conversation="does-not-exist"))
 
 	def test_bad_filenames(self):
 		cases = {
