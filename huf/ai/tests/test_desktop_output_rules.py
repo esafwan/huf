@@ -11,12 +11,14 @@ _spec = importlib.util.spec_from_file_location("desktop_output_rules", _p)
 r = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(r)
 
-b64 = lambda b: base64.b64encode(b).decode()
+
+def b64(b):
+	return base64.b64encode(b).decode()
 
 
 class TestValidate(unittest.TestCase):
 	def test_ok_pdf_and_text(self):
-		n, ext, ct, at, data, text = r.validate_upload("a.pdf", b64(b"%PDF-1.4 x"))
+		n, ext, ct, at, _data, text = r.validate_upload("a.pdf", b64(b"%PDF-1.4 x"))
 		self.assertEqual((n, ext, ct, at, text), ("a.pdf", "pdf", "application/pdf", "document", None))
 		self.assertEqual(r.validate_upload("n.md", b64(b"# hi"))[5], "# hi")
 
@@ -47,11 +49,11 @@ class TestValidate(unittest.TestCase):
 
 
 class TestRank(unittest.TestCase):
-	items = [
+	items = (
 		{"kind": "skill", "name": "docx", "description": "Word documents"},
 		{"kind": "agent", "name": "Report Writer", "description": "writes docx reports"},
 		{"kind": "skill", "name": "xlsx", "description": "Spreadsheets"},
-	]
+	)
 
 	def test_rank_and_filter(self):
 		self.assertEqual([i["name"] for i in r.rank_catalog(self.items, "docx")], ["docx", "Report Writer"])

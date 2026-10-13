@@ -15,8 +15,8 @@ import json
 
 import frappe
 
-from huf.ai import desktop_outputs as do
 from huf.ai import desktop_output_rules as rules
+from huf.ai import desktop_outputs as do
 from huf.ai.tests import desktop_test_helpers as h
 from huf.ai.tests.test_desktop_remote_sessions import RemoteBase
 
@@ -72,7 +72,14 @@ class TestUploadDesktopOutput(RemoteBase):
 
 	def test_conversation_not_hosted_by_device(self):
 		frappe.set_user(self.owner)
-		web = frappe.get_doc({"doctype": "Agent Conversation", "agent": self.agent, "title": "web", "session_id": frappe.generate_hash(length=12)})
+		web = frappe.get_doc(
+			{
+				"doctype": "Agent Conversation",
+				"agent": self.agent,
+				"title": "web",
+				"session_id": frappe.generate_hash(length=12),
+			}
+		)
 		web.insert(ignore_permissions=True)
 		self.track_conversation(web.name)
 		for conv in (web.name, "does-not-exist", None):
@@ -152,7 +159,15 @@ class TestUploadDesktopOutput(RemoteBase):
 		doc = frappe.get_doc("Artifact", out["artifact"])
 		self.assertEqual(doc.artifact_type, "image")
 		ptr = json.loads(doc.content)
-		self.assertEqual(ptr, {"file_url": out["file_url"], "filename": "shot.png", "content_type": "image/png", "size": len(PNG)})
+		self.assertEqual(
+			ptr,
+			{
+				"file_url": out["file_url"],
+				"filename": "shot.png",
+				"content_type": "image/png",
+				"size": len(PNG),
+			},
+		)
 		f = frappe.get_doc("File", {"attached_to_doctype": "Artifact", "attached_to_name": doc.name})
 		self.assertEqual(f.is_private, 1)
 		self.assertEqual(f.file_url, out["file_url"])

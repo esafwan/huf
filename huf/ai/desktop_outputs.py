@@ -22,16 +22,34 @@ def _deny(msg):
 
 
 @frappe.whitelist(methods=["POST"])
-def upload_desktop_output(executor_id=None, conversation=None, filename=None, content_b64=None, lease_secret=None):
+def upload_desktop_output(
+	executor_id=None, conversation=None, filename=None, content_b64=None, lease_secret=None
+):
 	"""Create an Artifact in a desktop-hosted conversation from bytes the desktop uploads."""
 	user = dx._require_user()
 	lease = dx._get_lease(dx._validate_executor_id(executor_id)) if executor_id else None
-	if not lease or lease.get("user") != user or not dx.secret_matches(lease, dx.presented_secret(lease_secret)):
+	if (
+		not lease
+		or lease.get("user") != user
+		or not dx.secret_matches(lease, dx.presented_secret(lease_secret))
+	):
 		_deny(_("A valid desktop lease secret is required."))
-	conv = frappe.db.get_value(
-		"Agent Conversation", conversation, ["name", "owner", "execution_host", "host_device_id"], as_dict=True
-	) if conversation else None
-	if not conv or conv.owner != user or conv.execution_host != "desktop" or conv.host_device_id != lease.get("device_id"):
+	conv = (
+		frappe.db.get_value(
+			"Agent Conversation",
+			conversation,
+			["name", "owner", "execution_host", "host_device_id"],
+			as_dict=True,
+		)
+		if conversation
+		else None
+	)
+	if (
+		not conv
+		or conv.owner != user
+		or conv.execution_host != "desktop"
+		or conv.host_device_id != lease.get("device_id")
+	):
 		_deny(_("This conversation is not hosted by this desktop."))
 	try:
 		name, ext, content_type, artifact_type, data, text = rules.validate_upload(filename, content_b64)
@@ -62,9 +80,17 @@ def upload_desktop_output(executor_id=None, conversation=None, filename=None, co
 			}
 		).insert(ignore_permissions=True)
 		file_url = f.file_url
-		doc.content = json.dumps({"file_url": file_url, "filename": name, "content_type": content_type, "size": len(data)})
+		doc.content = json.dumps(
+			{"file_url": file_url, "filename": name, "content_type": content_type, "size": len(data)}
+		)
 		doc.save(ignore_permissions=True)
-	return {"ok": True, "artifact": doc.name, "file_url": file_url, "size": len(data), "content_type": content_type}
+	return {
+		"ok": True,
+		"artifact": doc.name,
+		"file_url": file_url,
+		"size": len(data),
+		"content_type": content_type,
+	}
 
 
 @frappe.whitelist()
@@ -78,10 +104,29 @@ def search_skills_and_agents(query=None, kind="all", limit=50):
 		kind = "all"
 	items = []
 	if kind in ("all", "agent"):
-		for a in frappe.get_list("Agent", filters={"disabled": 0}, fields=["name", "agent_name", "description"], order_by="modified desc", limit_page_length=500):
-			items.append({"kind": "agent", "name": a.agent_name or a.name, "id": a.name, "description": a.description or ""})
+		for a in frappe.get_list(
+			"Agent",
+			filters={"disabled": 0},
+			fields=["name", "agent_name", "description"],
+			order_by="modified desc",
+			limit_page_length=500,
+		):
+			items.append(
+				{
+					"kind": "agent",
+					"name": a.agent_name or a.name,
+					"id": a.name,
+					"description": a.description or "",
+				}
+			)
 	if kind in ("all", "skill"):
-		for s in frappe.get_all("Skill", filters={"status": "Active"}, fields=["name", "skill_name", "title", "description", "source_type"], order_by="modified desc", limit_page_length=500):
+		for s in frappe.get_all(
+			"Skill",
+			filters={"status": "Active"},
+			fields=["name", "skill_name", "title", "description", "source_type"],
+			order_by="modified desc",
+			limit_page_length=500,
+		):
 			items.append(
 				{
 					"kind": "skill",
