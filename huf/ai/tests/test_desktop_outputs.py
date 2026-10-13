@@ -72,7 +72,7 @@ class TestUploadDesktopOutput(RemoteBase):
 
 	def test_conversation_not_hosted_by_device(self):
 		frappe.set_user(self.owner)
-		web = frappe.get_doc({"doctype": "Agent Conversation", "agent": self.agent, "title": "web"})
+		web = frappe.get_doc({"doctype": "Agent Conversation", "agent": self.agent, "title": "web", "session_id": frappe.generate_hash(length=12)})
 		web.insert(ignore_permissions=True)
 		self.track_conversation(web.name)
 		for conv in (web.name, "does-not-exist", None):
@@ -136,7 +136,7 @@ class TestUploadDesktopOutput(RemoteBase):
 			(doc.title, doc.artifact_type, doc.language, doc.conversation, doc.content),
 			("notes.md", "markdown", "md", self.conv, "# Hi ☃"),
 		)
-		self.assertEqual(doc.owner, "Administrator")
+		self.assertEqual(doc.owner, self.owner)
 		self.assertGreater(doc.size_bytes, 0)
 		self.assertTrue(doc.content_hash)
 
@@ -185,11 +185,9 @@ class TestSearchSkillsAndAgents(RemoteBase):
 		return do.search_skills_and_agents(**kw)
 
 	def test_guest_rejected(self):
+		frappe.set_user("Guest")
 		with self.assertRaises(frappe.PermissionError):
-			do.search_skills_and_agents  # whitelisted without allow_guest
-			frappe.set_user("Guest")
-			frappe.call(do.search_skills_and_agents, query=self.tag) if False else (_ for _ in ()).throw(frappe.PermissionError)
-		self.assertNotIn(do.search_skills_and_agents, frappe.allowed_guest_methods)
+			frappe.is_whitelisted(do.search_skills_and_agents)
 
 	def test_status_and_permission_filtering(self):
 		rows = self.search(query=self.tag)
@@ -213,7 +211,7 @@ class TestSearchSkillsAndAgents(RemoteBase):
 		frappe.db.commit()
 		rows = self.search(query=f"{self.tag}", kind="agent")
 		self.assertEqual(rows[0]["id"], self.public.name)
-		self.assertEqual(rows[-1]["name"], "other name") if False else None
+		self.assertEqual(rows[-1]["name"], "other name")
 		self.assertEqual(self.search(query=f"{self.tag} nomatchterm"), [])
 
 	def test_limit_and_garbage_input(self):
