@@ -9,7 +9,14 @@ import binascii
 import os
 import re
 
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+# Raw bytes. The upload is a base64 string in an ordinary (non ``upload_file``) request, which Frappe
+# caps at site_config ``max_file_size`` (default 25 MiB) for the WHOLE body, and base64 adds a third.
+# 15 MiB raw is ~20 MiB encoded, so it survives the default with headroom for form encoding and the
+# other fields (nginx allows 50m). Huf Desktop's own cap must not exceed this.
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_QUERY_CHARS = 100
+MAX_QUERY_TERMS = 8
+MAX_RESULTS = 100
 
 # extension -> (content type, Artifact.artifact_type, magic prefix or None, stored inline as text)
 ALLOWED = {
@@ -82,7 +89,7 @@ def validate_upload(filename, content_b64):
 def rank_catalog(items, query, kind="all", limit=50):
 	"""Rank ``[{kind, name, description, ...}]`` by query: name 3x, description 1x, every term must match.
 	Empty query keeps the order. ``kind`` filters to ``skill`` or ``agent``."""
-	terms = [t for t in str(query or "").lower().split() if t]
+	terms = [t for t in str(query or "")[:MAX_QUERY_CHARS].lower().split() if t][:MAX_QUERY_TERMS]
 	out = []
 	for i, it in enumerate(items):
 		if kind in ("skill", "agent") and it.get("kind") != kind:
@@ -104,4 +111,8 @@ def rank_catalog(items, query, kind="all", limit=50):
 			continue
 		out.append((-total, i, it))
 	out.sort(key=lambda r: (r[0], r[1]))
-	return [r[2] for r in out[: max(1, min(int(limit or 50), 200))]]
+	try:
+		limit = int(limit or 50)
+	except (TypeError, ValueError):
+		limit = 50
+	return [r[2] for r in out[: max(1, min(limit, MAX_RESULTS))]]

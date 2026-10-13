@@ -69,22 +69,27 @@ def upload_desktop_output(executor_id=None, conversation=None, filename=None, co
 
 @frappe.whitelist()
 def search_skills_and_agents(query=None, kind="all", limit=50):
-	"""Permission-aware search over agents and skills for the Skills & Agents box.
-	Rows: ``{kind, name, description, origin?, enabled}``; disabled agents are omitted."""
+	"""Search over agents and skills for the Skills & Agents box.
+	Rows: ``{kind, name, id, description, origin?, enabled}``. Agents come from ``frappe.get_list`` (the
+	Agent permission query: owner / allowed users / roles, enabled, non-system). Skills carry no
+	per-user permission (the Skill doctype is System Manager only and the rest of the app lists them
+	to every user through ``get_skill_options``), so only ``Active`` skills are listed."""
+	if kind not in ("all", "agent", "skill"):
+		kind = "all"
 	items = []
 	if kind in ("all", "agent"):
-		for a in frappe.get_list("Agent", filters={"disabled": 0}, fields=["name", "agent_name", "description"], limit_page_length=500):
+		for a in frappe.get_list("Agent", filters={"disabled": 0}, fields=["name", "agent_name", "description"], order_by="modified desc", limit_page_length=500):
 			items.append({"kind": "agent", "name": a.agent_name or a.name, "id": a.name, "description": a.description or ""})
 	if kind in ("all", "skill"):
-		for s in frappe.get_list("Skill", fields=["name", "skill_name", "description", "status", "source_type"], limit_page_length=500):
+		for s in frappe.get_all("Skill", filters={"status": "Active"}, fields=["name", "skill_name", "title", "description", "source_type"], order_by="modified desc", limit_page_length=500):
 			items.append(
 				{
 					"kind": "skill",
 					"name": s.skill_name or s.name,
 					"id": s.name,
-					"description": s.description or "",
+					"description": s.description or s.title or "",
 					"origin": s.source_type,
-					"enabled": (s.status or "").lower() in ("active", "enabled"),
+					"enabled": True,
 				}
 			)
 	return rules.rank_catalog(items, query, kind, limit)
